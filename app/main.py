@@ -2,7 +2,8 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.security import APIKeyHeader, APIKeyQuery
 
 from app.config import settings
 from app.bqca.client import chat, create_conversation
@@ -15,6 +16,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _processed_messages: set[str] = set()
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+_api_key_query = APIKeyQuery(name="key", auto_error=False)
+
+
+async def verify_api_key(
+    header_key: str = Depends(_api_key_header),
+    query_key: str = Depends(_api_key_query),
+):
+    """Verify API key if API_KEY is configured. Skip when not set."""
+    if not settings.API_KEY:
+        return True
+    key = header_key or query_key or ""
+    if key != settings.API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return True
 
 
 @asynccontextmanager
@@ -31,21 +48,17 @@ async def health():
 
 
 @app.post("/api/query")
-async def api_query(request: Request):
+async def api_query(request: Request, _auth=Depends(verify_api_key)):
     """
     Core query API.
+    Header: X-API-Key (required if API_KEY configured)
     Body: {"question": "...", "conversation_id": null (optional)}
     Returns: {"summary", "sql", "fields", "rows", "chart", "html_url"}
     """
-    if settings.API_KEY:
-        key = request.headers.get("X-API-Key", "") or request.query_params.get("key", "")
-        if key != settings.API_KEY:
-            return {"error": "unauthorized"}
-
     body = await request.json()
     question = body.get("question", "").strip()
     if not question:
-        return {"error": "question is required"}
+        raise HTTPException(status_code=400, detail="question is required")
 
     try:
         result = await asyncio.to_thread(chat, question, body.get("conversation_id"))
@@ -66,7 +79,7 @@ async def api_query(request: Request):
         }
     except Exception as e:
         logger.error("API query failed: %s", e, exc_info=True)
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/webhook/event")
