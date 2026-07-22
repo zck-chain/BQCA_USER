@@ -1,30 +1,32 @@
 import pytest
-from unittest.mock import patch, MagicMock
-from app.renderer.html_generator import generate_html_and_summary
+from app.bqca.client import ChatResult
+from app.renderer.html_generator import build_result_html
 
 
-@pytest.mark.asyncio
-async def test_generate_returns_html_and_summary():
-  mock_response = MagicMock()
-  mock_response.text = "---HTML---\n<html><body>chart</body></html>\n---SUMMARY---\n销售额最高的品类是电子"
+def test_build_result_html_with_data():
+    result = ChatResult(
+        summary="共有10个订单",
+        sql="SELECT * FROM orders LIMIT 10",
+        fields=["订单ID", "金额"],
+        rows=[{"订单ID": "1", "金额": "100"}, {"订单ID": "2", "金额": "200"}],
+        vega_config=None,
+    )
+    html = build_result_html("最近10个订单", result)
+    assert "最近10个订单" in html
+    assert "订单ID" in html
+    assert "共有10个订单" in html
+    assert "SELECT" in html
 
-  with patch("app.renderer.html_generator._call_gemini", return_value=mock_response):
-      html, summary = await generate_html_and_summary(
-          "哪个品类卖得最好",
-          [{"category": "Electronics", "total": 5000}],
-          ["category", "total"],
-      )
 
-  assert "<html>" in html
-  assert "电子" in summary or "品类" in summary
+def test_build_result_html_with_chart():
+    vega = {"mark": "bar", "data": {"values": [{"x": "A", "y": 1}]}, "encoding": {}}
+    result = ChatResult(vega_config=vega)
+    html = build_result_html("图表测试", result)
+    assert "vegaEmbed" in html
+    assert '"mark": "bar"' in html
 
 
-@pytest.mark.asyncio
-async def test_generate_fallback_on_exception():
-  with patch("app.renderer.html_generator._call_gemini", side_effect=Exception("API error")):
-      html, summary = await generate_html_and_summary(
-          "test", [{"a": 1}], ["a"]
-      )
-
-  assert "<html>" in html
-  assert "查看详情" in summary
+def test_build_result_html_empty():
+    result = ChatResult()
+    html = build_result_html("测试", result)
+    assert "测试" in html

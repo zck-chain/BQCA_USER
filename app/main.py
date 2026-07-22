@@ -5,11 +5,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 
 from app.config import settings
-from app.engine.schema import get_schema_text
-from app.engine.safety import check_sql_safety, enforce_limit
-from app.engine.sql_generator import generate_sql
-from app.engine.query_runner import run_query
-from app.renderer.html_generator import generate_html_and_summary
+from app.bqca.client import chat, create_conversation
+from app.renderer.html_generator import build_result_html
 from app.storage.gcs import upload_html, generate_query_id
 from app.feishu.event import extract_question, get_message_id, get_chat_id
 from app.feishu.message import send_text_message, send_result_card
@@ -18,20 +15,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _processed_messages: set[str] = set()
-_schema_text: str | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-
-
-def _ensure_schema() -> str:
-    global _schema_text
-    if _schema_text is None:
-        _schema_text = get_schema_text()
-        logger.info("Schema loaded: %d chars", len(_schema_text))
-    return _schema_text
 
 
 app = FastAPI(title="BQCA Feishu Bot", lifespan=lifespan)
@@ -69,35 +57,29 @@ async def webhook_event(request: Request):
 
 
 async def _process_query(question: str, chat_id: str):
-    """Async full query pipeline."""
+    """Full query pipeline: BQCA API -> HTML -> GCS -> Feishu card."""
     try:
         await send_text_message(chat_id, "正在查询，请稍候...")
 
-        # 0. Ensure schema loaded
-        schema_text = _ensure_schema()
+        # 1. Call BQCA Conversational Analytics API
+        result = await asyncio.to_thread(chat, question)
+        logger.info("BQCA result: %d rows, sql=%s, chart=%s",
+                     len(result.rows), bool(result.sql), bool(result.vega_config))
 
-        # 1. Generate SQL
-        sql = await generate_sql(question, schema_text)
-        logger.info("Generated SQL: %s", sql)
-        if not check_sql_safety(sql):
-            await send_text_message(chat_id, "无法执行该查询：仅支持数据查询操作。")
+        if not result.rows and not result.vega_config:
+            await send_text_message(chat_id, result.summary or "未查询到相关数据，请换个说法试试。")
             return
-        sql = enforce_limit(sql, settings.MAX_RESULT_ROWS)
 
-        # 2. Execute query
-        rows, columns = await run_query(sql)
-        logger.info("Query returned %d rows", len(rows))
+        # 2. Build HTML from result
+        html = build_result_html(question, result)
 
-        # 3. Generate HTML + summary
-        html, summary = await generate_html_and_summary(question, rows, columns)
-
-        # 4. Upload HTML
+        # 3. Upload HTML to GCS
         query_id = generate_query_id()
         url = await upload_html(query_id, html)
         logger.info("Result URL: %s", url)
 
-        # 5. Reply with result
-        await send_result_card(chat_id, summary, url)
+        # 4. Reply with card
+        await send_result_card(chat_id, result.summary or "查询完成，点击查看详情。", url)
 
     except Exception as e:
         logger.error("Query processing failed: %s", e, exc_info=True)

@@ -6,7 +6,7 @@ from app.config import settings
 
 async def upload_html(query_id: str, html_content: str) -> str:
   """Upload HTML to GCS public bucket, return public URL."""
-  client = storage.Client(project=settings.BQ_PROJECT)
+  client = storage.Client(project=settings.GCP_PROJECT)
   bucket = client.bucket(settings.GCS_BUCKET)
   blob_name = f"results/{query_id}.html"
   blob = bucket.blob(blob_name)
