@@ -1,6 +1,11 @@
- .env
- __pycache__/
- *.pyc
- .DS_Store
- .venv/
- *.egg-info/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+*.egg-info/
+*.pyc
+.DS_Store
+__pycache__/
+app/__pycache__/
+tests/__pycache__/
