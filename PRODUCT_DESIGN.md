@@ -16,7 +16,7 @@
  | 当前账号 | `chengkang.zhao@webeye.com`（BigQuery Admin + Gemini Data Analytics Admin） |
  | Service Account | `bqca-runner@webeye-internal-test.iam.gserviceaccount.com`（已具备 BQ Admin、Gemini、GCS 等权限） |
  | 已启用 API | BigQuery、Vertex AI、Dataform、Gemini、Cloud Run、Cloud Functions、Secret Manager |
- | 数据集 | `thelook_ecommerce`（5 张表） |
+| 数据集 | `thelook_ecommerce`（5 张表），可配置切换 |
  | 飞书 | 待创建机器人应用 |
  
  ### 数据集 Schema
@@ -100,7 +100,8 @@
 | 可视化 | Gemini 生成 HTML | 动态生成完整 HTML 可视化代码，灵活适配任意问题 |
  | HTML 托管 | GCS 公开桶 / Cloud Run 静态路由 | 简单可靠 |
  | 认证 | Service Account (`bqca-runner`) | 已创建，权限齐全 |
- | 配置管理 | Secret Manager | 存放飞书 App 凭证等敏感信息 |
+| 配置管理 | Secret Manager | 存放飞书 App 凭证等敏感信息 |
+| 数据集配置 | 环境变量 / 配置文件 | `BQ_DATASET=webeye-internal-test.thelook_ecommerce`，切换数据集只改此项 |
  
  ---
  
@@ -115,17 +116,18 @@
  
  ### 5.2 查询引擎模块
  
- **Prompt 构造策略：**
- ```
- System: 你是一个 BigQuery SQL 专家。根据以下表结构，将用户问题转为 SQL。
- 
- 表结构：
- - thelook_ecommerce.orders(order_id, user_id, status, gender, created_at, ...)
- - thelook_ecommerce.order_items(id, order_id, user_id, product_id, ...)
- - ...
- 
- 规则：
- - 只输出 SQL，不要解释
+**Prompt 构造策略：**
+
+表结构不硬编码，启动时从 BigQuery `INFORMATION_SCHEMA` 动态获取，注入到 prompt 中。切换数据集只需改配置，无需改代码。
+
+```
+System: 你是一个 BigQuery SQL 专家。根据以下表结构，将用户问题转为 SQL。
+
+表结构：
+{动态注入：从 INFORMATION_SCHEMA.COLUMNS 获取的当前数据集表结构}
+
+规则：
+- 只输出 SQL，不要解释
  - 使用标准 BigQuery SQL 语法
  - 日期字段用 TIMESTAMP 类型处理
  - LIMIT 默认不超过 1000
@@ -154,8 +156,8 @@
  - check_query_allowed(user_id, sql) → bool
  ```
  
- V1 阶段：所有用户可查 `thelook_ecommerce`，上限 1000 行。
- V2 阶段：按飞书用户/群组配置不同的数据访问范围。
+V1 阶段：所有用户可查配置中指定的数据集，上限 1000 行。
+V2 阶段：按飞书用户/群组配置不同的数据集和表访问范围。
  
  ---
  
