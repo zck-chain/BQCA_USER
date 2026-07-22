@@ -1,0 +1,6 @@
+.git
+.env
+__pycache__
+tests
+.DS_Store
+docs
