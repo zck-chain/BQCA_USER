@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     FEISHU_VERIFICATION_TOKEN: str = ""
     FEISHU_ENCRYPT_KEY: str = ""
     CA_LOCATION: str = "global"
+    API_KEY: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

@@ -30,6 +30,45 @@ async def health():
     return {"status": "ok"}
 
 
+@app.post("/api/query")
+async def api_query(request: Request):
+    """
+    Core query API.
+    Body: {"question": "...", "conversation_id": null (optional)}
+    Returns: {"summary", "sql", "fields", "rows", "chart", "html_url"}
+    """
+    if settings.API_KEY:
+        key = request.headers.get("X-API-Key", "") or request.query_params.get("key", "")
+        if key != settings.API_KEY:
+            return {"error": "unauthorized"}
+
+    body = await request.json()
+    question = body.get("question", "").strip()
+    if not question:
+        return {"error": "question is required"}
+
+    try:
+        result = await asyncio.to_thread(chat, question, body.get("conversation_id"))
+
+        html_url = None
+        if result.rows or result.vega_config:
+            html = build_result_html(question, result)
+            query_id = generate_query_id()
+            html_url = await upload_html(query_id, html)
+
+        return {
+            "summary": result.summary,
+            "sql": result.sql,
+            "fields": result.fields,
+            "rows": result.rows[:50],
+            "chart": bool(result.vega_config),
+            "html_url": html_url,
+        }
+    except Exception as e:
+        logger.error("API query failed: %s", e, exc_info=True)
+        return {"error": str(e)}
+
+
 @app.post("/webhook/event")
 async def webhook_event(request: Request):
     body = await request.json()
@@ -57,11 +96,10 @@ async def webhook_event(request: Request):
 
 
 async def _process_query(question: str, chat_id: str):
-    """Full query pipeline: BQCA API -> HTML -> GCS -> Feishu card."""
+    """Feishu handler: query -> reply in chat."""
     try:
         await send_text_message(chat_id, "正在查询，请稍候...")
 
-        # 1. Call BQCA Conversational Analytics API
         result = await asyncio.to_thread(chat, question)
         logger.info("BQCA result: %d rows, sql=%s, chart=%s",
                      len(result.rows), bool(result.sql), bool(result.vega_config))
@@ -70,15 +108,11 @@ async def _process_query(question: str, chat_id: str):
             await send_text_message(chat_id, result.summary or "未查询到相关数据，请换个说法试试。")
             return
 
-        # 2. Build HTML from result
         html = build_result_html(question, result)
-
-        # 3. Upload HTML to GCS
         query_id = generate_query_id()
         url = await upload_html(query_id, html)
         logger.info("Result URL: %s", url)
 
-        # 4. Reply with card
         await send_result_card(chat_id, result.summary or "查询完成，点击查看详情。", url)
 
     except Exception as e:
