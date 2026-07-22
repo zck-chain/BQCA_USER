@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     FEISHU_VERIFICATION_TOKEN: str = ""
     FEISHU_ENCRYPT_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.0-flash"
+    VERTEX_LOCATION: str = "asia-east1"
     MAX_RESULT_ROWS: int = 1000
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

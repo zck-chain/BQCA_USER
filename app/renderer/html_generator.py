@@ -24,32 +24,32 @@ HTML_SYSTEM_PROMPT = """你是一个数据可视化专家。根据用户问题�
 
 
 def _call_gemini(prompt: str) -> object:
-  vertexai.init(project=settings.BQ_PROJECT)
-  model = GenerativeModel(settings.GEMINI_MODEL)
-  response = model.generate_content(prompt)
-  return response
+    vertexai.init(project=settings.BQ_PROJECT, location=settings.VERTEX_LOCATION)
+    model = GenerativeModel(settings.GEMINI_MODEL)
+    response = model.generate_content(prompt)
+    return response
 
 
 def _fallback_html(rows: list[dict], columns: list[str]) -> str:
-  """Fallback: plain data table HTML, ensures link always works."""
-  header = "".join(f"<th>{c}</th>" for c in columns)
-  body_rows = ""
-  for row in rows[:100]:
-      cells = "".join(f"<td>{row.get(c, '')}</td>" for c in columns)
-      body_rows += f"<tr>{cells}</tr>"
-  return f"""<!DOCTYPE html>
+    """Fallback: plain data table HTML, ensures link always works."""
+    header = "".join(f"<th>{c}</th>" for c in columns)
+    body_rows = ""
+    for row in rows[:100]:
+        cells = "".join(f"<td>{row.get(c, '')}</td>" for c in columns)
+        body_rows += f"<tr>{cells}</tr>"
+    return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{{font-family:sans-serif;padding:16px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}th{{background:#f5f5f5}}</style>
 </head><body><table><thead><tr>{header}</tr></thead><tbody>{body_rows}</tbody></table></body></html>"""
 
 
 async def generate_html_and_summary(
-  question: str, rows: list[dict], columns: list[str]
+    question: str, rows: list[dict], columns: list[str]
 ) -> tuple[str, str]:
-  """Call Gemini to generate HTML visualization and Chinese summary. Falls back to plain table on failure."""
-  data_json = json.dumps(rows[:200], ensure_ascii=False, default=str)
+    """Call Gemini to generate HTML visualization and Chinese summary. Falls back to plain table on failure."""
+    data_json = json.dumps(rows[:200], ensure_ascii=False, default=str)
 
-  prompt = f"""{HTML_SYSTEM_PROMPT}
+    prompt = f"""{HTML_SYSTEM_PROMPT}
 
 用户问题：{question}
 
@@ -58,28 +58,28 @@ async def generate_html_and_summary(
 查询结果（JSON）：
 {data_json}"""
 
-  try:
-      response = _call_gemini(prompt)
-      text = response.text.strip()
+    try:
+        response = _call_gemini(prompt)
+        text = response.text.strip()
 
-      html = ""
-      summary = "查询完成，请查看详情。"
+        html = ""
+        summary = "查询完成，请查看详情。"
 
-      if "---HTML---" in text and "---SUMMARY---" in text:
-          parts = text.split("---SUMMARY---")
-          html_part = parts[0].replace("---HTML---", "").strip()
-          summary = parts[1].strip()
-          if html_part.startswith("```html"):
-              html_part = html_part[7:]
-          if html_part.startswith("```"):
-              html_part = html_part[3:]
-          if html_part.endswith("```"):
-              html_part = html_part[:-3]
-          html = html_part.strip()
+        if "---HTML---" in text and "---SUMMARY---" in text:
+            parts = text.split("---SUMMARY---")
+            html_part = parts[0].replace("---HTML---", "").strip()
+            summary = parts[1].strip()
+            if html_part.startswith("```html"):
+                html_part = html_part[7:]
+            if html_part.startswith("```"):
+                html_part = html_part[3:]
+            if html_part.endswith("```"):
+                html_part = html_part[:-3]
+            html = html_part.strip()
 
-      if not html:
-          html = _fallback_html(rows, columns)
+        if not html:
+            html = _fallback_html(rows, columns)
 
-      return html, summary
-  except Exception:
-      return _fallback_html(rows, columns), "查询完成，请查看详情。"
+        return html, summary
+    except Exception:
+        return _fallback_html(rows, columns), "查询完成，请查看详情。"
