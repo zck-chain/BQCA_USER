@@ -21,7 +21,7 @@ def _build_chart_html(vega_config: dict | None) -> str:
     if not vega_config:
         return ""
     spec_json = json.dumps(vega_config, ensure_ascii=False, default=str)
-    return f"""<div id="chart" style="width:100%;"></div>
+    return f"""<div id="chart" style="width:100%;min-height:300px;"></div>
 <script>
 vegaEmbed('#chart', {spec_json}, {{renderer: 'svg'}}).catch(console.error);
 </script>"""
@@ -31,30 +31,58 @@ def build_result_html(question: str, result: ChatResult) -> str:
     """Build a complete HTML page from BQCA ChatResult."""
     chart_section = _build_chart_html(result.vega_config)
     table_section = _build_table_html(result.fields, result.rows)
-    summary_html = f'<p class="summary">{result.summary}</p>' if result.summary else ""
-    sql_html = f"<details><summary>SQL</summary><pre><code>{result.sql}</code></pre></details>" if result.sql else ""
+
+    # Summary card
+    summary_html = ""
+    if result.summary:
+        summary_html = f'<div class="summary-card">{result.summary}</div>'
+
+    # SQL collapsible
+    sql_html = ""
+    if result.sql:
+        escaped_sql = result.sql.replace("<", "&lt;").replace(">", "&gt;")
+        sql_html = f"""<details class="sql-details"><summary>查看 SQL</summary>
+<pre><code>{escaped_sql}</code></pre></details>"""
+
+    # Build page sections
+    sections = []
+    if summary_html:
+        sections.append(summary_html)
+    if chart_section:
+        sections.append(f'<div class="chart-section">{chart_section}</div>')
+    if table_section:
+        sections.append(table_section)
+    if sql_html:
+        sections.append(sql_html)
+
+    # If nothing to show, display a friendly message
+    if not sections:
+        sections.append('<div class="summary-card">未查询到相关数据，请换个说法试试。</div>')
+
+    content = "\n".join(sections)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BQCA - {question}</title>
+<title>{question}</title>
 <script src="{VEGA_CDN}"></script>
 <script src="{VEGA_LITE_JS}"></script>
 <script src="{VEGA_EMBED_JS}"></script>
 <style>
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:20px;max-width:960px;margin:0 auto;color:#333}}
-h1{{font-size:18px;margin-bottom:8px}}
-.summary{{background:#f0f4ff;padding:12px 16px;border-radius:8px;margin:12px 0;line-height:1.6}}
-.table-wrap{{overflow-x:auto;margin:12px 0}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;padding:20px;max-width:960px;margin:0 auto;background:#f8f9fa;color:#1a1a1a;line-height:1.6}}
+h1{{font-size:20px;font-weight:600;margin-bottom:16px;color:#1a1a1a;padding-bottom:12px;border-bottom:1px solid #e8e8e8}}
+.summary-card{{background:#fff;padding:16px 20px;border-radius:10px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08);line-height:1.8;font-size:15px}}
+.chart-section{{background:#fff;padding:20px;border-radius:10px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
+.table-wrap{{background:#fff;border-radius:10px;padding:16px;overflow-x:auto;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
 table{{border-collapse:collapse;width:100%;font-size:14px}}
-th,td{{border:1px solid #e0e0e0;padding:8px 12px;text-align:left;white-space:nowrap}}
-th{{background:#f5f5f5;font-weight:600}}
-details{{margin:8px 0;font-size:13px;color:#666}}
-details pre{{background:#f8f8f8;padding:12px;border-radius:6px;overflow-x:auto}}
+th{{background:#f0f2f5;font-weight:600;text-align:left;padding:10px 14px;border-bottom:2px solid #e0e0e0;white-space:nowrap}}
+td{{padding:10px 14px;border-bottom:1px solid #f0f0f0;white-space:nowrap}}
+tr:hover td{{background:#fafbfc}}
+.sql-details{{margin:8px 0;font-size:13px;color:#666}}
+.sql-details summary{{cursor:pointer;padding:8px 0;color:#888;font-size:13px}}
+.sql-details pre{{background:#fff;padding:16px;border-radius:8px;overflow-x:auto;font-size:13px;margin-top:8px;border:1px solid #eee}}
 </style>
 </head><body>
 <h1>{question}</h1>
-{summary_html}
-{chart_section}
-{table_section}
-{sql_html}
+{content}
 </body></html>"""
