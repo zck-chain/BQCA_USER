@@ -38,19 +38,14 @@
     │
     ├─ 1. 飞书事件模块：验签 + 提取问题文本 + 即时回复"正在查询..."
     │
-    ├─ 2. 权限模块：根据 API Key / 飞书用户 ID 查权限配置
-    │     └─ 构建 systemInstruction 注入访问规则（软约束）
-    │
-    ├─ 3. BQCA 查询：问题 + 权限规则 → CA API → Agent 处理全流程
+    ├─ 2. BQCA 查询：问题 → CA API → Agent 处理全流程
     │     └─ Agent 内部：NL→SQL→BQ 查询→结果分析→图表生成
     │
-    ├─ 4. 权限后置检查：校验 SQL 是否越权 + 过滤结果中敏感列（硬约束）
+    ├─ 3. HTML 渲染：问题 + 数据 + 图表 → Vega-Lite 嵌入的 HTML 页面
     │
-    ├─ 5. HTML 渲染：问题 + 数据 + 图表 → Vega-Lite 嵌入的 HTML 页面
+    ├─ 4. 存储：HTML → GCS 公开桶 → 返回 URL
     │
-    ├─ 6. 存储：HTML → GCS 公开桶 → 返回 URL
-    │
-    └─ 7. 回复飞书：摘要 + "查看详情"卡片链接
+    └─ 5. 回复飞书：摘要 + "查看详情"卡片链接
           └─ 幂等处理：基于 message_id 去重，防飞书重试
 ```
 
@@ -77,10 +72,6 @@
 - `ChatRequest.conversation_reference.conversation` → 已创建的会话
 - `ChatRequest.conversation_reference.data_agent_context.data_agent` → Agent 路径
 
-权限控制增强后计划切换到 `client_managed_resource_context` 模式：
-- 可同时指定 `agent_id` + `inline_context`（含动态 `system_instruction`）
-- 无需 CA API 管理会话持久化，由应用层控制
-
 ---
 
 ## 模块职责与边界
@@ -89,7 +80,6 @@
 app/
 ├── main.py              # FastAPI 入口：/health, /api/query, /webhook/event
 ├── config.py            # 配置管理（环境变量）
-├── permissions.py       # 权限控制（Profile 配置、systemInstruction 构建、SQL 检查、列过滤）
 ├── bqca/
 │   ├── __init__.py
 │   └── client.py        # CA API 调用：chat(), create_conversation(), ChatResult
@@ -107,49 +97,8 @@ app/
 
 **各模块职责：**
 - `bqca/client.py`：封装 CA API 调用，返回结构化的 `ChatResult`（summary + sql + fields + rows + vega_config）
-- `permissions.py`：API Key/飞书用户 → PermissionProfile 映射，三层权限执行
 - `renderer/html_generator.py`：将 ChatResult 渲染为包含 Vega-Lite 嵌入的 HTML 页面
 - `feishu/`：飞书事件接收和消息回复
-
----
-
-## 权限控制设计
-
-### 三层执行模型
-
-| 层级 | 机制 | 说明 |
-|------|------|------|
-| 软约束 | systemInstruction 注入 | 在 CA API 请求中注入访问规则，引导 Agent 不越权 |
-| 硬约束 1 | SQL 后置检查 | 检查 BQCA 生成的 SQL 是否引用了被禁止的表 |
-| 硬约束 2 | 结果列过滤 | 从返回数据中移除敏感列（email、phone 等） |
-
-### 权限配置
-
-```python
-# 权限 Profile 定义
-PROFILES = {
-    "admin": PermissionProfile(agent_id="ecommerce-analyst-cn"),  # 全权限
-    "sales": PermissionProfile(
-        agent_id="ecommerce-analyst-cn",
-        allowed_tables=["orders", "products", "order_items"],
-        column_restrictions={"users": ["id", "first_name", "last_name"]},
-    ),
-    "marketing": PermissionProfile(
-        agent_id="ecommerce-analyst-cn",
-        column_restrictions={"users": ["id", "first_name", ...]},  # 不含 email
-    ),
-}
-
-# API Key → Profile 映射
-API_KEY_MAP = {"<YOUR_API_KEY>": "admin"}
-
-# 飞书用户 → Profile 映射
-FEISHU_USER_MAP = {}
-```
-
-### 为什么不在 BigQuery 层做权限
-
-所有请求通过 `bqca-runner` SA 访问 BigQuery（该 SA 有 BQ Admin），BigQuery 的 IAM 策略对它不生效。权限控制必须在应用层实现。
 
 ---
 
@@ -161,10 +110,10 @@ FEISHU_USER_MAP = {}
 | `CA_AGENT_ID` | BQCA Agent ID | `ecommerce-analyst-cn` |
 | `CA_LOCATION` | CA API 区域 | `global` |
 | `GCS_BUCKET` | HTML 存储桶名 | `bqca-results` |
-| `API_KEY` | 管理 API Key | `UC-...` |
+| `API_KEY` | 管理 API Key | 已配置 |
 | `FEISHU_APP_ID` | 飞书应用 ID | 已配置 |
-| `FEISHU_APP_SECRET` | 飞书应用密钥 | （已配置） |
-| `FEISHU_VERIFICATION_TOKEN` | 事件验签 token | （已配置） |
+| `FEISHU_APP_SECRET` | 飞书应用密钥 | 已配置 |
+| `FEISHU_VERIFICATION_TOKEN` | 事件验签 token | 已配置 |
 | `FEISHU_ENCRYPT_KEY` | 事件加密 key | 空（未启用） |
 
 ---
@@ -184,8 +133,6 @@ FEISHU_USER_MAP = {}
 | 场景 | 处理方式 |
 |------|----------|
 | BQCA API 调用失败 | 回复"查询处理失败，请稍后再试或换种说法" |
-| SQL 越权（引用被禁止的表） | 回复"您没有权限查看这些数据" |
-| 结果包含敏感列 | 自动过滤后返回 |
 | 飞书事件重复推送 | 基于 message_id 去重 |
 | 无 API Key 或 Key 无效 | 返回 401 |
 
@@ -215,6 +162,6 @@ gcloud run deploy bqca-bot \
 
 **V1（已完成）：** 核心问答链路 — 飞书提问 → CA API → HTML 可视化 → 返回摘要+链接
 
-**V2（当前）：** 权限体系 + 对话式追问 + 定时报告推送 + 数据异常告警 + 多数据集
+**V2（当前）：** 对话式追问、定时报告推送、数据异常告警、多数据集、查询历史
 
-**V3：** 高级权限（行级策略）+ 查询审计日志 + 多租户隔离
+**V3：** 权限体系（谁可用、谁能看什么数据）、查询审计日志、多租户隔离

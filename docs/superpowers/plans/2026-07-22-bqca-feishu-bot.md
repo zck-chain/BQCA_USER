@@ -2,9 +2,9 @@
 
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
 
-**目标：** 实现飞书机器人 → BQCA CA API → HTML 可视化 → 返回摘要+链接的完整问答链路，并集成权限控制
+**目标：** 实现飞书机器人 → BQCA CA API → HTML 可视化 → 返回摘要+链接的完整问答链路
 
-**架构：** Cloud Run 上的 FastAPI 服务，接收飞书事件 webhook，调用 BQCA Conversational Analytics API（Direct API 单代理模式），BQCA Agent 内部完成 NL→SQL→查询→分析全流程，服务端仅负责渲染 HTML、权限控制和存储。
+**架构：** Cloud Run 上的 FastAPI 服务，接收飞书事件 webhook，调用 BQCA Conversational Analytics API（Direct API 单代理模式），BQCA Agent 内部完成 NL→SQL→查询→分析全流程，服务端仅负责渲染 HTML 和存储。
 
 **技术栈：** Python 3.11, FastAPI, google-cloud-geminidataanalytics, google-cloud-storage, httpx（飞书 API 调用）
 
@@ -187,67 +187,7 @@ async def _process_query(question: str, chat_id: str):
 
 ---
 
-## 任务 6：权限控制模块
-
-**文件：**
-- 创建：`app/permissions.py`
-
-**核心设计：** 因为所有请求通过 `bqca-runner` SA 访问 BigQuery，BigQuery 层面的 IAM 策略不生效，权限控制必须在应用层实现。
-
-- [x] **步骤 1：定义权限数据模型**
-
-```python
-@dataclass
-class AccessRules:
-    allowed_tables: list[str] | None        # 表级白名单
-    column_restrictions: dict[str, list[str]]  # 列级限制（表→允许的列）
-    row_restrictions: str                    # 行级过滤条件
-
-@dataclass
-class PermissionProfile:
-    name: str
-    agent_id: str                           # 绑定到特定 BQCA Agent
-    description: str
-    access_rules: AccessRules | None        # None = 全权限 admin
-```
-
-- [x] **步骤 2：定义权限 Profile 和映射**
-
-- `PROFILES` 字典 — 定义角色（admin/sales/marketing）
-- `API_KEY_MAP` — API Key → Profile 映射
-- `FEISHU_USER_MAP` — 飞书用户 open_id → Profile 映射
-
-- [x] **步骤 3：实现三层权限执行**
-
-1. **软约束 — systemInstruction 注入**：`build_access_system_instruction(profile)` 构建访问规则文本，注入到 CA API 请求中引导 Agent 不越权
-
-2. **硬约束 1 — SQL 后置检查**：`check_sql_access(sql, profile)` 提取 SQL 中的表名，检查是否引用了被禁止的表
-
-3. **硬约束 2 — 结果列过滤**：`filter_result_columns(fields, rows, profile)` 从返回数据中移除敏感列
-
-- [ ] **步骤 4：集成权限到 BQCA 客户端**
-
-修改 `app/bqca/client.py`：
-- `chat()` 函数接受 `PermissionProfile` 参数
-- 使用 `client_managed_resource_context` 替代 `conversation_reference`
-- 动态注入 `system_instruction` 到 CA API 请求
-
-- [ ] **步骤 5：集成权限到 API 和飞书链路**
-
-修改 `app/main.py`：
-- `/api/query` — 根据 API Key 查 Profile，传入 `chat()` + 后置检查
-- `/webhook/event` — 根据飞书用户 ID 查 Profile，传入 `chat()` + 后置检查
-
-- [ ] **步骤 6：端到端权限测试**
-
-验证：
-- admin key → 全部数据
-- sales key → 只能查 orders/products/order_items 表，users 表只看到 id/name
-- 无效 key → 401
-
----
-
-## 任务 7：对话式追问支持
+## 任务 6：对话式追问支持
 
 **文件：**
 - 修改：`app/bqca/client.py`
@@ -265,13 +205,13 @@ class PermissionProfile:
 
 ---
 
-## 任务 8：多 Agent 支持
+## 任务 7：多 Agent 支持
 
 **文件：**
-- 修改：`app/permissions.py`
 - 修改：`app/bqca/client.py`
+- 修改：`app/config.py`
 
-- [ ] **步骤 1：在 PermissionProfile 中支持不同 Agent**
+- [ ] **步骤 1：支持通过参数选择不同 Agent**
 
 当前已配置的 BQCA Agent：
 
@@ -283,16 +223,29 @@ class PermissionProfile:
 | `agent_7a5d530d-379c-4f2a-8d47-a28d4aab2f12` | TPC-DS Retail Insights | tpc_ds_1g |
 | `agent_86f6f746-efa5-4336-85e6-eb5af7d636b4` | 农夫山泉_测试环境 | nfsq_test |
 
-每个 Profile 绑定不同的 `agent_id`，实现表级权限隔离。
+- [ ] **步骤 2：`chat()` 函数支持动态传入 agent_id**
 
-- [ ] **步骤 2：`chat()` 函数根据 Profile 动态选择 Agent**
+---
+
+## 任务 8：定时报告推送与数据异常告警
+
+**文件：**
+- 新增：`app/scheduler/` 模块
+
+- [ ] **步骤 1：实现定时查询调度**
+
+- 支持配置定时任务（cron 表达式）
+- 到时间自动调 CA API 查询并推送飞书消息
+
+- [ ] **步骤 2：实现数据异常告警**
+
+- 配置阈值规则
+- 查询结果超阈值时主动推送告警到飞书
 
 ---
 
 ## 任务 9：部署与文档更新
 
-- [ ] **步骤 1：更新 Cloud Run 部署（集成权限模块后）**
+- [ ] **步骤 1：更新 Cloud Run 部署**
 
 - [ ] **步骤 2：更新设计文档和实现计划，确保与代码一致**
-
-- [ ] **步骤 3：补充权限配置说明文档**
