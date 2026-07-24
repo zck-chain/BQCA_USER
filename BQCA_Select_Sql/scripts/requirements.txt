@@ -1,3 +1,0 @@
-google-cloud-geminidataanalytics>=0.13.1
-google-auth>=2.0
-google-cloud-storage>=2.0
