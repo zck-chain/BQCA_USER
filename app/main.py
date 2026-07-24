@@ -9,8 +9,9 @@ from fastapi.security import APIKeyHeader, APIKeyQuery
 
 from app.config import settings
 from app.bqca.client import chat, create_conversation, KEY_TO_SA
-from app.renderer.html_generator import build_result_html
-from app.storage.gcs import upload_html, generate_query_id
+# TODO: HTML 生成功能暂时注释，后续改为让 BQCA 直接生成前端代码
+# from app.renderer.html_generator import build_result_html
+# from app.storage.gcs import upload_html, generate_query_id
 from app.feishu.event import extract_question, get_message_id, get_chat_id
 from app.feishu.message import send_text_message, send_result_card
 
@@ -118,10 +119,11 @@ async def api_query(request: Request, _auth=Depends(verify_api_key)):
         _save_conversation(session_key, result.conversation_name)
 
         html_url = None
-        if result.rows or result.vega_config:
-            html = build_result_html(question, result)
-            query_id = generate_query_id()
-            html_url = await upload_html(query_id, html)
+        # TODO: HTML 生成暂时注释
+        # if result.rows or result.vega_config:
+        #     html = build_result_html(question, result)
+        #     query_id = generate_query_id()
+        #     html_url = await upload_html(query_id, html)
 
         return {
             "summary": result.summary,
@@ -129,7 +131,7 @@ async def api_query(request: Request, _auth=Depends(verify_api_key)):
             "fields": result.fields,
             "rows": result.rows[:50],
             "chart": bool(result.vega_config),
-            "html_url": html_url,
+            "html_url": None,  # TODO: 恢复 html_url
             "conversation_id": result.conversation_name,
         }
     except Exception as e:
@@ -184,12 +186,14 @@ async def _process_query(question: str, chat_id: str):
             await send_text_message(chat_id, result.summary or "未查询到相关数据，请换个说法试试。")
             return
 
-        html = build_result_html(question, result)
-        query_id = generate_query_id()
-        url = await upload_html(query_id, html)
-        logger.info("Result URL: %s", url)
+        # TODO: HTML 生成暂时注释，直接发送文本结果
+        # html = build_result_html(question, result)
+        # query_id = generate_query_id()
+        # url = await upload_html(query_id, html)
+        # logger.info("Result URL: %s", url)
+        # await send_result_card(chat_id, result.summary or "查询完成，点击查看详情。", url)
 
-        await send_result_card(chat_id, result.summary or "查询完成，点击查看详情。", url)
+        await send_text_message(chat_id, result.summary or "查询完成。")
 
     except Exception as e:
         logger.error("Query processing failed: %s", e, exc_info=True)

@@ -173,3 +173,17 @@ def chat(question: str, conversation_name: str | None = None,
                  len(result.rows), bool(result.sql), bool(result.vega_config),
                  target_sa or "default")
     return result
+
+
+# TODO: 让 BQCA 生成前端 HTML 代码，从 summary 中提取并直接上传
+# def extract_html_from_summary(summary: str) -> str | None:
+#     """Extract HTML code block from BQCA summary text.
+#
+#     Looks for ```html ... ``` blocks. Returns the HTML content or None.
+#     """
+#     import re
+#     pattern = re.compile(r"```html\s*\n(.*?)```", re.DOTALL)
+#     match = pattern.search(summary)
+#     if match:
+#         return match.group(1).strip()
+#     return None

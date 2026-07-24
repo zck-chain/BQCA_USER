@@ -10,3 +10,7 @@ __pycache__/
 app/__pycache__/
 tests/__pycache__/
 logs/
+
+# Local BQCA credentials and packaging artifacts
+BQCA_Select_Sql/assets/bqca-runner-key.json
+BQCA_Select_Sql.zip
