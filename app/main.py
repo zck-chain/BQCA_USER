@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -14,18 +15,21 @@ from app.bqca.client import chat
 # from app.storage.gcs import upload_html, generate_query_id
 from app.feishu.event import extract_question, get_message_id, get_chat_id
 from app.feishu.message import send_text_message, send_result_card
+from app.storage.sqlite import (
+    init_db,
+    is_message_processed,
+    add_processed_message,
+    get_chat_conversation,
+    save_chat_conversation,
+    get_role_session,
+    save_role_session,
+    clear_role_conversation,
+    cleanup_expired_sessions,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_processed_messages: set[str] = set()
-
-# chat_id / API session → (conversation_name, last_active_timestamp)
-_session_store: dict[str, tuple[str, float]] = {}
-# Demo session ID → (selected role, last_active_timestamp)
-_feishu_role_sessions: dict[str, tuple[str, float]] = {}
-# Demo session ID → BQCA conversation name for the selected role
-_feishu_conversations: dict[str, str] = {}
 SESSION_TTL = 1800  # 30 minutes
 
 DEMO_ROLES = {"运营经理", "一线客服"}
@@ -36,37 +40,15 @@ ROLE_ALIASES = {
     "物流": "一线客服",
 }
 
-def _cleanup_sessions() -> None:
-    """Remove expired sessions from the store."""
-    now = time.time()
-    expired = [k for k, (_, ts) in _session_store.items() if now - ts > SESSION_TTL]
-    for k in expired:
-        logger.info("Session expired: %s", k)
-        del _session_store[k]
-
-    expired_role_sessions = [
-        key for key, (_, ts) in _feishu_role_sessions.items() if now - ts > SESSION_TTL
-    ]
-    for key in expired_role_sessions:
-        del _feishu_role_sessions[key]
-        _feishu_conversations.pop(key, None)
-
 
 def _get_conversation(session_key: str) -> str | None:
     """Get an active conversation name for a session key, or None if expired."""
-    entry = _session_store.get(session_key)
-    if entry is None:
-        return None
-    convo_name, ts = entry
-    if time.time() - ts > SESSION_TTL:
-        del _session_store[session_key]
-        return None
-    return convo_name
+    return get_chat_conversation(session_key, SESSION_TTL)
 
 
 def _save_conversation(session_key: str, conversation_name: str) -> None:
     """Save or refresh a session mapping."""
-    _session_store[session_key] = (conversation_name, time.time())
+    save_chat_conversation(session_key, conversation_name)
 
 
 def _resolve_demo_role(role: str | None) -> str | None:
@@ -77,26 +59,24 @@ def _resolve_demo_role(role: str | None) -> str | None:
 
 
 def _get_feishu_role(session_id: str) -> str | None:
-    entry = _feishu_role_sessions.get(session_id)
-    if entry is None:
-        return None
-    role, timestamp = entry
-    if time.time() - timestamp > SESSION_TTL:
-        del _feishu_role_sessions[session_id]
-        return None
+    role, _ = get_role_session(session_id, SESSION_TTL)
     return role
 
 
 def _save_feishu_role(session_id: str, role: str) -> None:
-    _feishu_role_sessions[session_id] = (role, time.time())
+    save_role_session(session_id, role)
 
 
 def _get_feishu_conversation(session_id: str) -> str | None:
-    return _feishu_conversations.get(session_id)
+    _, conversation_name = get_role_session(session_id, SESSION_TTL)
+    return conversation_name
 
 
 def _save_feishu_conversation(session_id: str, conversation_name: str) -> None:
-    _feishu_conversations[session_id] = conversation_name
+    # Fetch existing role to preserve it while updating conversation_name
+    role = _get_feishu_role(session_id)
+    if role:
+        save_role_session(session_id, role, conversation_name)
 
 
 def _service_account_for_role(role: str) -> str | None:
@@ -107,11 +87,14 @@ def _service_account_for_role(role: str) -> str | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialise SQLite tables on startup
+    init_db()
+
     # Periodic session cleanup
     async def _cleanup_loop():
         while True:
             await asyncio.sleep(300)
-            _cleanup_sessions()
+            cleanup_expired_sessions(SESSION_TTL)
 
     task = asyncio.create_task(_cleanup_loop())
     yield
@@ -145,8 +128,9 @@ async def api_query(request: Request):
     if role is None:
         raise HTTPException(status_code=400, detail="role is required for a new session")
 
+    # If the role is switched, clear the current conversation to avoid cross-talk
     if requested_role is not None and requested_role != saved_role:
-        _feishu_conversations.pop(session_id, None)
+        clear_role_conversation(session_id)
 
     _save_feishu_role(session_id, role)
     conversation_name = _get_feishu_conversation(session_id)
@@ -197,9 +181,9 @@ async def webhook_event(request: Request):
     event = body.get("event", {})
 
     msg_id = get_message_id(event)
-    if msg_id in _processed_messages:
+    if is_message_processed(msg_id):
         return {"status": "ok"}
-    _processed_messages.add(msg_id)
+    add_processed_message(msg_id)
 
     logger.info("Feishu event: %s", json.dumps(event, ensure_ascii=False)[:500])
     question = extract_question(event)
@@ -210,6 +194,24 @@ async def webhook_event(request: Request):
     asyncio.create_task(_process_query(question, chat_id))
 
     return {"status": "ok"}
+
+
+def clean_summary(text: str) -> str:
+    """Strip verbose English 'thought process' and raw SQL dumps from BQCA response,
+    returning only the final Chinese report to pass Feishu's Content Audit (DLP).
+    """
+    if not text:
+        return text
+    # Find the first Chinese character (Unicode range: 4E00-9FFF)
+    match = re.search(r'[\u4e00-\u9fff]', text)
+    if match:
+        start_idx = match.start()
+        # Backtrack past markdown formatting like '#', ' ', '\n'
+        backtrack_idx = start_idx
+        while backtrack_idx > 0 and text[backtrack_idx-1] in ['#', ' ', '\n', '\r', '*', '-']:
+            backtrack_idx -= 1
+        return text[backtrack_idx:].strip()
+    return text
 
 
 async def _process_query(question: str, chat_id: str):
@@ -228,8 +230,10 @@ async def _process_query(question: str, chat_id: str):
                      len(result.rows), bool(result.sql), bool(result.vega_config),
                      result.conversation_name[-20:] if result.conversation_name else "none")
 
+        summary = clean_summary(result.summary)
+
         if not result.rows and not result.vega_config:
-            await send_text_message(chat_id, result.summary or "未查询到相关数据，请换个说法试试。")
+            await send_text_message(chat_id, summary or "未查询到相关数据，请换个说法试试。")
             return
 
         # TODO: HTML 生成暂时注释，直接发送文本结果
@@ -239,7 +243,7 @@ async def _process_query(question: str, chat_id: str):
         # logger.info("Result URL: %s", url)
         # await send_result_card(chat_id, result.summary or "查询完成，点击查看详情。", url)
 
-        await send_text_message(chat_id, result.summary or "查询完成。")
+        await send_text_message(chat_id, summary or "查询完成。")
 
     except Exception as e:
         logger.error("Query processing failed: %s", e, exc_info=True)

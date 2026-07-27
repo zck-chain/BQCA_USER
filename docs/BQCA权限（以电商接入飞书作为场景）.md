@@ -13,6 +13,20 @@
 | 3. BigQuery | `bigquery.jobUser` + 数据集/表/列/行级权限 | 执行查询 + 读取数据 | gcloud / bq / SQL |
 | 4. Impersonation | `iam.serviceAccountTokenCreator` | Cloud Run 冒充该 SA | gcloud SA 级 IAM |
 
+### 权限作用速查
+
+| 权限 | 配置位置 | 解决什么问题 | 不解决什么问题 |
+|------|----------|--------------|----------------|
+| `roles/cloudaicompanion.user` | 项目 IAM | 允许 SA 调用 Conversational Analytics API | 不代表能进入某个 BQCA Agent，也不代表能读 BigQuery 表 |
+| `roles/geminidataanalytics.dataAgentUser` | BQCA Agent IAM | 允许 SA 和指定 Agent 对话 | 不授予 BigQuery 数据读取权限 |
+| `roles/bigquery.jobUser` | 项目 IAM | 允许 SA 创建 BigQuery 查询作业 | 不授予任何表数据读取权限 |
+| 数据集 `READER` / `roles/bigquery.dataViewer` | BigQuery 数据集或表 | 允许读取数据集或表 | 不控制行级过滤；如果表上有 RAP，还要命中 RAP grantee |
+| Row Access Policy (RAP) | BigQuery 实体表 | 控制同一张表里哪些行可见 | 不隐藏列；多个 RAP 命中同一身份时是并集 |
+| Authorized View | BigQuery 视图 + 源数据集授权 | 用视图控制可见列、聚合口径或脱敏结果 | 不等于列级权限；Agent 要指向这些视图才有演示效果 |
+| `roles/iam.serviceAccountTokenCreator` | 被冒充的 SA IAM | 允许 Cloud Run 运行身份换取目标 SA token | 不授予 BQCA 或 BigQuery 数据权限 |
+
+> 结论：给一个新 SA 配 BQCA 查询权限时，先配「能调用 BQCA + 能创建 BigQuery Job + 能读数据」；再用「数据集/表权限、RAP、视图」控制它在 BigQuery 里能看到哪些表、哪些行、哪些字段。
+
 ## 详细步骤
 
 ### 第 1 步：创建 SA（如未创建）
@@ -113,7 +127,14 @@ for ds in sorted(datasets):
 "
 ```
 
-当前 Agent 关联的数据集：`thelook_bq`、`firebas_bq`、`workspace_test_demo_001`。
+当前实测（2026-07-27）Agent 关联的数据源：
+
+| 数据集 | 表 | 新 SA 是否需要读权限 |
+|--------|----|----------------------|
+| `thelook_bq` | `distribution_centers`、`events`、`inventory_items`、`order_items`、`orders`、`products`、`users` | 需要 |
+| `workspace_test_demo_001` | `t_verified_smart_drive` | 如果 Agent 保持关联，则需要 |
+
+> 本次实测的 Agent 返回中没有 `firebas_bq`。如果后续重新把 `firebas_bq` 加回 Agent 数据源，再给对应 SA 补该数据集读权限。
 
 #### 5a. 数据集级只读（推荐）
 
@@ -294,12 +315,12 @@ KEY_TO_SA: dict[str, str] = {
 gcloud run deploy bqca-bot ... --set-env-vars="API_KEY=${BQCA_MANAGER_API_KEY},..."
 ```
 
-## 当前已配置的 SA
+## 当前已配置的 SA（2026-07-27 实测）
 
 | SA | API Key | 权限范围 | 角色 |
 |----|---------|----------|------|
-| bqca-runner | ${BQCA_MANAGER_API_KEY} | 全部表全字段（bigquery.admin，无 impersonation） | admin |
-| bqca-restricted | ${BQCA_SUPPORT_API_KEY} | 数据集级只读 + orders/order_items 行级（仅 Shipped），列级暂未生效（US 多区域不支持 Policy Tag） | restricted |
+| bqca-runner | ${BQCA_MANAGER_API_KEY} | 项目级 BigQuery Admin；默认 BQCA 执行身份；可看全量数据 | 运营经理 / admin |
+| bqca-restricted | ${BQCA_SUPPORT_API_KEY} | BigQuery JobUser + 指定数据集 READER + `orders` / `order_items` 行级过滤 | 一线客服 / restricted |
 
 ### bqca-runner 权限明细
 
@@ -315,9 +336,11 @@ gcloud run deploy bqca-bot ... --set-env-vars="API_KEY=${BQCA_MANAGER_API_KEY},.
 **数据集级权限**：
 - `thelook_bq`：通过 `bigquery.admin` 继承全量访问
 - `workspace_test_demo_001`：OWNER
+- `firebas_bq`：通过 `bigquery.admin` 可访问，但当前 Agent 未关联该数据集
 
 **Agent 级权限**：
 - `ecommerce-analyst-cn`：`dataAgentUser`
+- 项目级还有 `geminidataanalytics.admin`，可管理 BQCA 相关资源
 
 **行级权限（RAP）**：
 - `thelook_bq.orders` → `admin_all_rows`（grantee，FILTER USING TRUE）
@@ -336,7 +359,7 @@ gcloud run deploy bqca-bot ... --set-env-vars="API_KEY=${BQCA_MANAGER_API_KEY},.
 **数据集级权限**：
 - `thelook_bq`：READER
 - `workspace_test_demo_001`：READER
-- `firebas_bq`：通过项目级 `projectReaders` 继承 READER
+- `firebas_bq`：无直接 READER；当前 Agent 未关联该数据集，暂不需要
 
 **Agent 级权限**：
 - `ecommerce-analyst-cn`：`dataAgentUser`
@@ -350,6 +373,14 @@ gcloud run deploy bqca-bot ... --set-env-vars="API_KEY=${BQCA_MANAGER_API_KEY},.
 - `chengkang.zhao@webeye.com` 可 impersonate `bqca-restricted`（`serviceAccountTokenCreator`）
 
 **列级权限**：暂未生效（`thelook_bq` 在 US 多区域，不支持 Data Catalog Policy Tag）
+
+### 当前权限链路怎么生效
+
+| 场景 | 使用身份 | 需要的权限链 | 当前效果 |
+|------|----------|--------------|----------|
+| 运营经理通过 manager key 查询 | Cloud Run 默认身份 `bqca-runner` | `cloudaicompanion.user` + Agent `dataAgentUser` + BigQuery Admin / 数据读取权限 + `admin_all_rows` RAP | 可查全量订单状态、全量订单明细和其他数据源 |
+| 一线客服通过 support key 查询 | Cloud Run impersonate `bqca-restricted` | `cloudaicompanion.user` + Agent `dataAgentUser` + `bigquery.jobUser` + 数据集 READER + `shipped_only` RAP + TokenCreator | 当前仅可看 `orders` / `order_items` 中 `status = 'Shipped'` 的行 |
+| 新增一个受限 SA | 新 SA | 同 support key：项目级 CA + Agent User + JobUser + 数据集读权限 + RAP grantee + TokenCreator + API Key 映射 | 能否看哪些表由数据集/表权限决定；能看哪些行由 RAP 决定 |
 
 ## 实测问题与解决方案汇总
 
@@ -425,7 +456,7 @@ curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
 | 数据集 | bqca-runner (admin) | bqca-restricted (restricted) |
 |--------|---------------------|------|
 | thelook_bq | 全量读写（admin） | 只读（READER） |
-| firebas_bq | 全量读写（admin） | 只读（projectReaders 继承） |
+| firebas_bq | 全量读写（admin） | 无直接 READER；当前 Agent 未关联，暂不需要 |
 | workspace_test_demo_001 | OWNER | READER |
 
 ### 行级权限验证
@@ -516,3 +547,24 @@ gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL --member="serviceAc
 
 # 7. 代码注册 API Key（app/bqca/client.py 的 KEY_TO_SA）+ 重新部署
 ```
+
+### 新 SA 配置时如何控制 BigQuery 表范围
+
+基础权限只解决「能不能发起查询」：
+
+- `cloudaicompanion.user`：能调 CA API。
+- Agent `dataAgentUser`：能和指定 BQCA Agent 对话。
+- `bigquery.jobUser`：能创建 BigQuery 查询作业。
+- 数据集或表 `READER`：能读取对应数据。
+- `serviceAccountTokenCreator`：Cloud Run 能 impersonate 这个 SA。
+
+表、行、列的控制要分开做：
+
+| 控制目标 | 推荐方式 | 示例 |
+|----------|----------|------|
+| 控制能访问哪些数据集 | 只给 Agent 当前关联数据集加 READER | 当前至少是 `thelook_bq`；如保留验证表，再加 `workspace_test_demo_001` |
+| 控制能访问哪些表 | 给特定表授权，或给只包含允许表的视图数据集授权 | 客服 Agent 只挂 `support_*_v` 视图 |
+| 控制能访问哪些行 | 在实体表上配置 RAP | `orders` / `order_items` 给客服 SA 配 `shipped_only` 或地区范围过滤 |
+| 控制能访问哪些列 | 单区域数据集用 Policy Tag；当前 US 多区域不适合 | 现阶段用 Authorized View 隐藏 `email`、`street_address`、`cost`、`ip_address` 等字段 |
+
+> Demo 里如果要展示「同一个问题，不同权限不同答案」，最稳定的组合是：运营经理 Agent 指向原始数据集；客服 Agent 指向脱敏视图数据集，同时在 `orders` / `order_items` 上保留 RAP 做行级差异。

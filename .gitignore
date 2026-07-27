@@ -15,3 +15,12 @@ docs/
 # Local BQCA credentials and packaging artifacts
 BQCA_Select_Sql/assets/bqca-runner-key.json
 BQCA_Select_Sql.zip
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+
+# Temporary / diagnostic files
+scratch/
+

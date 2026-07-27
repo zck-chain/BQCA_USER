@@ -5,7 +5,13 @@ description: 通过角色选择查询权限的电商数据技能。适用于一�
 
 # BQCA 电商数据查询
 
-调用服务：`POST https://bqca-bot-839062387451.asia-east1.run.app/api/query`。
+> [!IMPORTANT]
+> **集成配置指南 (HTTP 超时设置)：**
+> 由于本服务涉及大模型自然语言 SQL 语义翻译、GCP 服务账号扮演安全鉴权以及 BigQuery 数仓的物理数据执行，单次完整调用耗时通常在 **10 ~ 15 秒** 左右。
+> 
+> 在将此技能导入至 **Dify、Coze、Custom GPTs (Actions)** 或其他智能体平台时，请务必在工具/动作的高级设置中，将该 API 的 **HTTP 请求超时时间 (HTTP Timeout) 配置为不低于 30 秒（推荐 60 秒）**，否则会因为平台默认的 10 秒超时而导致连接中断报错。
+
+调用服务：`POST https://exemption-wizard-seclusion.ngrok-free.dev/api/query`。
 
 服务端根据角色选择对应 Service Account，绝不在请求、回答或本技能文件中包含 API Key。
 
