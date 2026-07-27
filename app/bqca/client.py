@@ -31,6 +31,8 @@ class ChatResult:
     fields: list[str] = field(default_factory=list)
     rows: list[dict] = field(default_factory=list)
     vega_config: dict | None = None
+    thinking_process: list[str] = field(default_factory=list)
+    recommended_questions: list[str] = field(default_factory=list)
 
 
 def _agent_path() -> str:
@@ -141,7 +143,11 @@ def chat(question: str, conversation_name: str | None = None,
         if "text" in sm_dict:
             parts = sm_dict["text"].get("parts", [])
             for part in parts:
-                if not _is_noise(part):
+                if _is_noise(part):
+                    cleaned_thought = part.strip()
+                    if cleaned_thought:
+                        result.thinking_process.append(cleaned_thought)
+                else:
                     text_parts.append(part)
 
         if "data" in sm_dict:
@@ -157,6 +163,13 @@ def chat(question: str, conversation_name: str | None = None,
             chart = sm_dict["chart"]
             if "result" in chart:
                 result.vega_config = chart["result"].get("vegaConfig")
+
+        if "exampleQueries" in sm_dict:
+            eqs = sm_dict["exampleQueries"].get("exampleQueries", [])
+            for eq in eqs:
+                q = eq.get("naturalLanguageQuestion")
+                if q and q not in result.recommended_questions:
+                    result.recommended_questions.append(q)
 
     if text_parts:
         result.summary = " ".join(text_parts)

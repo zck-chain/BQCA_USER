@@ -14,7 +14,7 @@ from app.bqca.client import chat
 # from app.renderer.html_generator import build_result_html
 # from app.storage.gcs import upload_html, generate_query_id
 from app.feishu.event import extract_question, get_message_id, get_chat_id
-from app.feishu.message import send_text_message, send_result_card
+from app.feishu.message import send_text_message, send_result_card, send_premium_result_card
 from app.storage.sqlite import (
     init_db,
     is_message_processed,
@@ -173,6 +173,16 @@ async def api_query(request: Request):
 async def webhook_event(request: Request):
     body = await request.json()
 
+    # Handle Feishu Card Action Event (One-click quick query)
+    if "action" in body and "open_chat_id" in body:
+        action_val = body["action"].get("value", {})
+        if action_val.get("action") == "quick_query":
+            next_query = action_val.get("query")
+            chat_id = body.get("open_chat_id")
+            logger.info("Feishu Card Action click: %r in chat %s", next_query, chat_id)
+            asyncio.create_task(_process_query(next_query, chat_id))
+            return {}
+
     # Feishu URL verification
     if body.get("type") == "url_verification":
         return {"challenge": body.get("challenge")}
@@ -196,22 +206,40 @@ async def webhook_event(request: Request):
     return {"status": "ok"}
 
 
-def clean_summary(text: str) -> str:
-    """Strip verbose English 'thought process' and raw SQL dumps from BQCA response,
-    returning only the final Chinese report to pass Feishu's Content Audit (DLP).
+def extract_thoughts_and_summary(raw_text: str) -> tuple[list[str], str]:
+    """Split the raw BQCA summary text into a list of English thought paragraphs
+    and the final Chinese report based on Chinese character density.
+    This prevents English reasoning from leaking into the final report while
+    fully populating the collapsible thinking panel.
     """
-    if not text:
-        return text
-    # Find the first Chinese character (Unicode range: 4E00-9FFF)
-    match = re.search(r'[\u4e00-\u9fff]', text)
-    if match:
-        start_idx = match.start()
-        # Backtrack past markdown formatting like '#', ' ', '\n'
-        backtrack_idx = start_idx
-        while backtrack_idx > 0 and text[backtrack_idx-1] in ['#', ' ', '\n', '\r', '*', '-']:
-            backtrack_idx -= 1
-        return text[backtrack_idx:].strip()
-    return text
+    if not raw_text:
+        return [], ""
+    
+    paragraphs = raw_text.split("\n")
+    thoughts = []
+    chinese_paragraphs = []
+    
+    found_chinese_report = False
+    
+    for p in paragraphs:
+        stripped = p.strip()
+        if not stripped:
+            continue
+            
+        # Calculate Chinese character density
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', stripped))
+        ratio = chinese_chars / len(stripped) if len(stripped) > 0 else 0
+        
+        # If a paragraph has high Chinese density (> 20%), it starts the Chinese report
+        if ratio > 0.20:
+            found_chinese_report = True
+            
+        if found_chinese_report:
+            chinese_paragraphs.append(p)
+        else:
+            thoughts.append(p)
+            
+    return thoughts, "\n\n".join(chinese_paragraphs).strip()
 
 
 async def _process_query(question: str, chat_id: str):
@@ -230,10 +258,13 @@ async def _process_query(question: str, chat_id: str):
                      len(result.rows), bool(result.sql), bool(result.vega_config),
                      result.conversation_name[-20:] if result.conversation_name else "none")
 
-        summary = clean_summary(result.summary)
+        # Split BQCA text into English thinking lines and Chinese summary
+        thoughts, summary = extract_thoughts_and_summary(result.summary)
+        if thoughts:
+            result.thinking_process.extend(thoughts)
 
         if not result.rows and not result.vega_config:
-            await send_text_message(chat_id, summary or "未查询到相关数据，请换个说法试试。")
+            await send_premium_result_card(chat_id, question, result, summary or "未查询到相关数据，请换个说法试试。")
             return
 
         # TODO: HTML 生成暂时注释，直接发送文本结果
@@ -243,7 +274,7 @@ async def _process_query(question: str, chat_id: str):
         # logger.info("Result URL: %s", url)
         # await send_result_card(chat_id, result.summary or "查询完成，点击查看详情。", url)
 
-        await send_text_message(chat_id, summary or "查询完成。")
+        await send_premium_result_card(chat_id, question, result, summary or "查询完成。")
 
     except Exception as e:
         logger.error("Query processing failed: %s", e, exc_info=True)
