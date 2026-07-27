@@ -10,7 +10,9 @@ class Settings(BaseSettings):
     FEISHU_VERIFICATION_TOKEN: str = ""
     FEISHU_ENCRYPT_KEY: str = ""
     CA_LOCATION: str = "global"
-    API_KEY: str = ""
+    BQCA_SUPPORT_SERVICE_ACCOUNT: str = (
+        "bqca-restricted@webeye-internal-test.iam.gserviceaccount.com"
+    )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

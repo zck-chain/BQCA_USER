@@ -2,13 +2,13 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Depends, HTTPException
-from fastapi.security import APIKeyHeader, APIKeyQuery
+from fastapi import FastAPI, Request, HTTPException
 
 from app.config import settings
-from app.bqca.client import chat, create_conversation, KEY_TO_SA
+from app.bqca.client import chat
 # TODO: HTML 生成功能暂时注释，后续改为让 BQCA 直接生成前端代码
 # from app.renderer.html_generator import build_result_html
 # from app.storage.gcs import upload_html, generate_query_id
@@ -22,11 +22,19 @@ _processed_messages: set[str] = set()
 
 # chat_id / API session → (conversation_name, last_active_timestamp)
 _session_store: dict[str, tuple[str, float]] = {}
+# Demo session ID → (selected role, last_active_timestamp)
+_feishu_role_sessions: dict[str, tuple[str, float]] = {}
+# Demo session ID → BQCA conversation name for the selected role
+_feishu_conversations: dict[str, str] = {}
 SESSION_TTL = 1800  # 30 minutes
 
-_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-_api_key_query = APIKeyQuery(name="key", auto_error=False)
-
+DEMO_ROLES = {"运营经理", "一线客服"}
+ROLE_ALIASES = {
+    "经理": "运营经理",
+    "管理员": "运营经理",
+    "客服": "一线客服",
+    "物流": "一线客服",
+}
 
 def _cleanup_sessions() -> None:
     """Remove expired sessions from the store."""
@@ -35,6 +43,13 @@ def _cleanup_sessions() -> None:
     for k in expired:
         logger.info("Session expired: %s", k)
         del _session_store[k]
+
+    expired_role_sessions = [
+        key for key, (_, ts) in _feishu_role_sessions.items() if now - ts > SESSION_TTL
+    ]
+    for key in expired_role_sessions:
+        del _feishu_role_sessions[key]
+        _feishu_conversations.pop(key, None)
 
 
 def _get_conversation(session_key: str) -> str | None:
@@ -54,20 +69,40 @@ def _save_conversation(session_key: str, conversation_name: str) -> None:
     _session_store[session_key] = (conversation_name, time.time())
 
 
-async def verify_api_key(
-    header_key: str = Depends(_api_key_header),
-    query_key: str = Depends(_api_key_query),
-):
-    """Verify API key if API_KEY is configured. Always pass through key for SA impersonation."""
-    key = header_key or query_key or ""
+def _resolve_demo_role(role: str | None) -> str | None:
+    if not role:
+        return None
+    normalized = ROLE_ALIASES.get(role.strip(), role.strip())
+    return normalized if normalized in DEMO_ROLES else None
 
-    if not settings.API_KEY:
-        # No global API_KEY set — still accept keys from KEY_TO_SA for SA impersonation
-        return key if key in KEY_TO_SA else True
 
-    if key != settings.API_KEY and key not in KEY_TO_SA:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    return key or True
+def _get_feishu_role(session_id: str) -> str | None:
+    entry = _feishu_role_sessions.get(session_id)
+    if entry is None:
+        return None
+    role, timestamp = entry
+    if time.time() - timestamp > SESSION_TTL:
+        del _feishu_role_sessions[session_id]
+        return None
+    return role
+
+
+def _save_feishu_role(session_id: str, role: str) -> None:
+    _feishu_role_sessions[session_id] = (role, time.time())
+
+
+def _get_feishu_conversation(session_id: str) -> str | None:
+    return _feishu_conversations.get(session_id)
+
+
+def _save_feishu_conversation(session_id: str, conversation_name: str) -> None:
+    _feishu_conversations[session_id] = conversation_name
+
+
+def _service_account_for_role(role: str) -> str | None:
+    if role == "运营经理":
+        return None
+    return settings.BQCA_SUPPORT_SERVICE_ACCOUNT
 
 
 @asynccontextmanager
@@ -92,38 +127,47 @@ async def health():
 
 
 @app.post("/api/query")
-async def api_query(request: Request, _auth=Depends(verify_api_key)):
+async def api_query(request: Request):
     """
-    Core query API.
-    Header: X-API-Key (required if API_KEY configured)
-    Body: {"question": "...", "conversation_id": null (optional, auto-managed if omitted)}
-    Returns: {"summary", "sql", "fields", "rows", "chart", "html_url", "conversation_id"}
+    Role-based query API for the Demo skill.
+    Body: {"question", "role", "session_id", "conversation_id"}
     """
     body = await request.json()
     question = body.get("question", "").strip()
+    session_id = body.get("session_id") or uuid.uuid4().hex
+    requested_role = _resolve_demo_role(body.get("role"))
+
+    if body.get("role") and requested_role is None:
+        raise HTTPException(status_code=400, detail="unsupported role")
+
+    saved_role = _get_feishu_role(session_id)
+    role = requested_role or saved_role
+    if role is None:
+        raise HTTPException(status_code=400, detail="role is required for a new session")
+
+    if requested_role is not None and requested_role != saved_role:
+        _feishu_conversations.pop(session_id, None)
+
+    _save_feishu_role(session_id, role)
+    conversation_name = _get_feishu_conversation(session_id)
     if not question:
+        if requested_role is not None:
+            return {
+                "message": f"已切换为{role}",
+                "session_id": session_id,
+                "conversation_id": conversation_name,
+                "role": role,
+            }
         raise HTTPException(status_code=400, detail="question is required")
 
-    # Resolve conversation: explicit > session-stored > new
-    conversation_name = body.get("conversation_id")
-    if not conversation_name:
-        # Use client IP + API key as a lightweight session key
-        session_key = f"api:{request.client.host}:{_auth if isinstance(_auth, str) else settings.API_KEY}"
-        conversation_name = _get_conversation(session_key)
-
     try:
-        result = await asyncio.to_thread(chat, question, conversation_name, _auth if isinstance(_auth, str) else None)
-
-        # Save conversation for future follow-ups
-        session_key = f"api:{request.client.host}:{_auth if isinstance(_auth, str) else settings.API_KEY}"
-        _save_conversation(session_key, result.conversation_name)
-
-        html_url = None
-        # TODO: HTML 生成暂时注释
-        # if result.rows or result.vega_config:
-        #     html = build_result_html(question, result)
-        #     query_id = generate_query_id()
-        #     html_url = await upload_html(query_id, html)
+        result = await asyncio.to_thread(
+            chat,
+            question,
+            conversation_name,
+            target_service_account=_service_account_for_role(role),
+        )
+        _save_feishu_conversation(session_id, result.conversation_name)
 
         return {
             "summary": result.summary,
@@ -132,11 +176,13 @@ async def api_query(request: Request, _auth=Depends(verify_api_key)):
             "rows": result.rows[:50],
             "chart": bool(result.vega_config),
             "html_url": None,  # TODO: 恢复 html_url
+            "session_id": session_id,
             "conversation_id": result.conversation_name,
+            "role": role,
         }
     except Exception as e:
         logger.error("API query failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="query failed")
 
 
 @app.post("/webhook/event")

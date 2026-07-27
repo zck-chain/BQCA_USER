@@ -11,12 +11,6 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# API Key → Service Account email mapping
-# When a key maps to a different SA, we impersonate that SA
-KEY_TO_SA: dict[str, str] = {
-    "BQ-RnzRKoqvsvQ8flP8vLZi-THbjE4ct9N0dnIzyQ": "bqca-restricted@webeye-internal-test.iam.gserviceaccount.com",
-}
-
 # Patterns that indicate BQCA internal status, not user-facing text
 _NOISE_PATTERNS = [
     re.compile(r"^Analyzing context", re.IGNORECASE),
@@ -112,16 +106,14 @@ def _is_noise(text: str) -> bool:
 
 
 def chat(question: str, conversation_name: str | None = None,
-         api_key: str | None = None) -> ChatResult:
+         target_service_account: str | None = None) -> ChatResult:
     """
     Send a question to the BQCA agent via the Conversational Analytics API.
     If conversation_name is None, a new conversation is created (single-turn).
-    If api_key is provided, the corresponding SA is impersonated for the call.
+    If target_service_account is provided, impersonate it for the call.
     Returns a ChatResult with summary, SQL, data rows, and optional chart.
     """
-    # Resolve which SA to impersonate based on API key
-    target_sa = KEY_TO_SA.get(api_key) if api_key else None
-    credentials = _get_credentials(target_sa)
+    credentials = _get_credentials(target_service_account)
 
     chat_client = _get_client(credentials)
 
@@ -171,7 +163,7 @@ def chat(question: str, conversation_name: str | None = None,
 
     logger.info("BQCA chat done: %d rows, sql=%s, chart=%s, sa=%s",
                  len(result.rows), bool(result.sql), bool(result.vega_config),
-                 target_sa or "default")
+                 target_service_account or "default")
     return result
 
 

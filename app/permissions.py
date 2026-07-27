@@ -83,10 +83,8 @@ PROFILES: dict[str, PermissionProfile] = {
     ),
 }
 
-# API Key -> profile name mapping
-API_KEY_MAP: dict[str, str] = {
-    "UC-q_q4prqeYrb41-F8PRljuj29asWE4": "admin",
-}
+# API Key -> profile name mapping. The current role-based query flow does not use API keys.
+API_KEY_MAP: dict[str, str] = {}
 
 # Feishu user open_id -> profile name mapping
 FEISHU_USER_MAP: dict[str, str] = {}
