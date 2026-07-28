@@ -12,7 +12,7 @@ _tenant_token: str | None = None
 async def _get_tenant_token() -> str:
   """Get Feishu tenant_access_token."""
   global _tenant_token
-  async with httpx.AsyncClient() as client:
+  async with httpx.AsyncClient(timeout=20.0) as client:
       resp = await client.post(
           "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
           json={
@@ -28,16 +28,17 @@ async def _get_tenant_token() -> str:
 async def send_text_message(chat_id: str, text: str) -> dict:
   """Send plain text message."""
   token = await _get_tenant_token()
+  receive_id_type = "open_id" if chat_id.startswith("ou_") else "chat_id"
   payload = {
       "receive_id": chat_id,
       "msg_type": "text",
       "content": json.dumps({"text": text}),
   }
-  logger.info("Sending Feishu message to %s, text length=%d", chat_id, len(text))
-  async with httpx.AsyncClient() as client:
+  logger.info("Sending Feishu message to %s (type=%s), text length=%d", chat_id, receive_id_type, len(text))
+  async with httpx.AsyncClient(timeout=20.0) as client:
       resp = await client.post(
           "https://open.feishu.cn/open-apis/im/v1/messages",
-          params={"receive_id_type": "chat_id"},
+          params={"receive_id_type": receive_id_type},
           headers={"Authorization": f"Bearer {token}"},
           json=payload,
       )
@@ -52,6 +53,7 @@ async def send_text_message(chat_id: str, text: str) -> dict:
 async def send_result_card(chat_id: str, summary: str, result_url: str) -> dict:
   """Send result card with summary and detail link."""
   token = await _get_tenant_token()
+  receive_id_type = "open_id" if chat_id.startswith("ou_") else "chat_id"
   card_content = {
       "elements": [
           {"tag": "div", "text": {"tag": "lark_md", "content": summary}},
@@ -64,7 +66,7 @@ async def send_result_card(chat_id: str, summary: str, result_url: str) -> dict:
   async with httpx.AsyncClient() as client:
       resp = await client.post(
           "https://open.feishu.cn/open-apis/im/v1/messages",
-          params={"receive_id_type": "chat_id"},
+          params={"receive_id_type": receive_id_type},
           headers={"Authorization": f"Bearer {token}"},
           json={
               "receive_id": chat_id,
@@ -75,7 +77,7 @@ async def send_result_card(chat_id: str, summary: str, result_url: str) -> dict:
       return resp.json()
 
 
-async def send_premium_result_card(chat_id: str, question: str, result, cleaned_summary: str) -> dict:
+async def send_premium_result_card(chat_id: str, question: str, result, cleaned_summary: str, result_url: str | None = None) -> dict:
     """Send high-quality interactive message card (lark v2 card) with:
     - Custom indigo AI theme header
     - User's natural language question
@@ -95,31 +97,25 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
         "content": f"**🔍 提问问题：**\n{question}"
     })
 
-    # 2. Collapsible Thinking Process Block
-    if result.thinking_process:
-        thoughts_text = "\n".join([f"> {t}" for t in result.thinking_process if t.strip()])
-        if thoughts_text:
-            elements.append({
-                "tag": "collapsible_panel",
-                "expanded": False,
-                "header": {
-                  "title": {"tag": "plain_text", "content": "⚙️ 显示思考过程 (Thinking Process)"}
-                },
-                "elements": [
-                  {
-                    "tag": "markdown",
-                    "content": thoughts_text
-                  }
-                ]
-            })
+    # 2. Collapsible Thinking Process Block (Temporarily commented out per user request for a cleaner, premium UI)
+    # if result.thinking_process:
+    #     thoughts_text = "\n".join([f"> {t}" for t in result.thinking_process if t.strip()])
+    #     if thoughts_text:
+    #         elements.append({
+    #             "tag": "collapsible_panel",
+    #             "expanded": False,
+    #             "header": {
+    #               "title": {"tag": "plain_text", "content": "⚙️ 显示思考过程 (Thinking Process)"}
+    #             },
+    #             "elements": [
+    #               {
+    #                 "tag": "markdown",
+    #                 "content": thoughts_text
+    #               }
+    #             ]
+    #         })
 
-    # 3. Cleaned Summary (Business Insight / Analysis)
-    elements.append({
-        "tag": "markdown",
-        "content": f"**📝 逻辑分析与业务洞察：**\n{cleaned_summary or '查询成功，请见下方明细。'}"
-    })
-
-    # 4. Collapsible Generated SQL Block
+    # 3. Collapsible Generated SQL Block
     if result.sql:
         elements.append({
             "tag": "collapsible_panel",
@@ -135,45 +131,88 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
             ]
         })
 
-    # 5. Dynamic Data Table Block
+    # 4. Dynamic Data Table Block
     if result.rows and result.fields:
+        main_rows = result.rows[:10]
+        remaining_rows = result.rows[10:]
+
         table_md = "| " + " | ".join(result.fields) + " |\n"
         table_md += "| " + " | ".join(["---"] * len(result.fields)) + " |\n"
-        for row in result.rows[:10]:
+        for row in main_rows:
             table_md += "| " + " | ".join(str(row.get(f, "-")) for f in result.fields) + " |\n"
-        
-        row_count = len(result.rows)
-        if row_count > 10:
-            table_md += f"\n*⚠️ 共 {row_count} 行数据，卡片内仅展示前 10 行。*"
 
         elements.append({
             "tag": "markdown",
             "content": f"**📊 数据查询结果展示：**\n\n{table_md}"
         })
 
+        if remaining_rows:
+            rem_table_md = "| " + " | ".join(result.fields) + " |\n"
+            rem_table_md += "| " + " | ".join(["---"] * len(result.fields)) + " |\n"
+            for row in remaining_rows[:30]:
+                rem_table_md += "| " + " | ".join(str(row.get(f, "-")) for f in result.fields) + " |\n"
+            
+            rem_count = len(remaining_rows)
+            if rem_count > 30:
+                rem_table_md += f"\n*⚠️ 仅展示前 30 行余量数据。*"
+
+            elements.append({
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                  "title": {"tag": "plain_text", "content": f"🔽 展开查看其余 {rem_count} 行数据"}
+                },
+                "elements": [
+                  {
+                    "tag": "markdown",
+                    "content": rem_table_md
+                  }
+                ]
+            })
+
+    # 5. Cleaned Summary (Business Insight / Analysis) - Moved to the end of informative content
+    elements.append({
+        "tag": "markdown",
+        "content": cleaned_summary or "查询成功，请见下方明细。"
+    })
+
+    # 5.5. Chart and Interactive Page Action Buttons (Temporarily commented out per user's strict 5-section layout requirement)
+    # if result_url:
+    #     if result.vega_config:
+    #         elements.append({
+    #             "tag": "markdown",
+    #             "content": "**📈 可视化图表已生成：**\n系统已为您绘制好专业的交互式数据分析图表（支持缩放/悬浮）。"
+    #         })
+    #         elements.append({
+    #             "tag": "button",
+    #             "text": {"tag": "plain_text", "content": "📊 点击查看交互式分析图表"},
+    #             "url": result_url,
+    #             "type": "primary"
+    #         })
+    #     else:
+    #         elements.append({
+    #             "tag": "button",
+    #             "text": {"tag": "plain_text", "content": "🔍 查看完整网页版数据报表"},
+    #             "url": result_url,
+    #             "type": "default"
+    #         })
+
     # 6. Interactive Actions / Recommended Questions Block
     if result.recommended_questions:
-        buttons = []
+        elements.append({
+            "tag": "markdown",
+            "content": "**🚀 快捷追问深度分析：**"
+        })
         for q in result.recommended_questions[:3]:
             display_title = q[:18] + "..." if len(q) > 18 else q
-            buttons.append({
+            elements.append({
                 "tag": "button",
-                "text": {"tag": "plain_text", "content": display_title},
+                "text": {"tag": "plain_text", "content": f"💬 {display_title}"},
                 "type": "default",
                 "value": {
                     "action": "quick_query",
                     "query": q
                 }
-            })
-        
-        if buttons:
-            elements.append({
-                "tag": "markdown",
-                "content": "**🚀 快捷追问深度分析：**"
-            })
-            elements.append({
-                "tag": "action",
-                "actions": buttons
             })
 
     # Create Lark Card Schema 2.0 Content
@@ -202,11 +241,12 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
         "content": json.dumps(card_content),
     }
 
-    logger.info("Sending premium interactive card to %s, elements_count=%d", chat_id, len(elements))
-    async with httpx.AsyncClient() as client:
+    receive_id_type = "open_id" if chat_id.startswith("ou_") else "chat_id"
+    logger.info("Sending premium interactive card to %s (type=%s), elements_count=%d", chat_id, receive_id_type, len(elements))
+    async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(
             "https://open.feishu.cn/open-apis/im/v1/messages",
-            params={"receive_id_type": "chat_id"},
+            params={"receive_id_type": receive_id_type},
             headers={"Authorization": f"Bearer {token}"},
             json=payload,
         )

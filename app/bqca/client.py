@@ -141,14 +141,28 @@ def chat(question: str, conversation_name: str | None = None,
         sm_dict = MessageToDict(message.system_message._pb)
 
         if "text" in sm_dict:
-            parts = sm_dict["text"].get("parts", [])
-            for part in parts:
-                if _is_noise(part):
+            text_obj = sm_dict["text"]
+            text_type = text_obj.get("textType", "")
+            parts = text_obj.get("parts", [])
+            
+            if text_type == "FOLLOWUP_QUESTIONS":
+                for part in parts:
+                    q = part.strip()
+                    if q and q not in result.recommended_questions:
+                        result.recommended_questions.append(q)
+            elif text_type == "THOUGHT":
+                for part in parts:
                     cleaned_thought = part.strip()
-                    if cleaned_thought:
+                    if cleaned_thought and cleaned_thought not in result.thinking_process:
                         result.thinking_process.append(cleaned_thought)
-                else:
-                    text_parts.append(part)
+            else:
+                for part in parts:
+                    if _is_noise(part):
+                        cleaned_thought = part.strip()
+                        if cleaned_thought and cleaned_thought not in result.thinking_process:
+                            result.thinking_process.append(cleaned_thought)
+                    else:
+                        text_parts.append(part)
 
         if "data" in sm_dict:
             data = sm_dict["data"]

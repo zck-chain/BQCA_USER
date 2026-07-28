@@ -10,10 +10,9 @@ from fastapi import FastAPI, Request, HTTPException
 
 from app.config import settings
 from app.bqca.client import chat
-# TODO: HTML 生成功能暂时注释，后续改为让 BQCA 直接生成前端代码
 # from app.renderer.html_generator import build_result_html
 # from app.storage.gcs import upload_html, generate_query_id
-from app.feishu.event import extract_question, get_message_id, get_chat_id
+from app.feishu.event import extract_question, get_message_id, get_chat_id, get_sender_id
 from app.feishu.message import send_text_message, send_result_card, send_premium_result_card
 from app.storage.sqlite import (
     init_db,
@@ -179,8 +178,14 @@ async def webhook_event(request: Request):
         if action_val.get("action") == "quick_query":
             next_query = action_val.get("query")
             chat_id = body.get("open_chat_id")
-            logger.info("Feishu Card Action click: %r in chat %s", next_query, chat_id)
-            asyncio.create_task(_process_query(next_query, chat_id))
+            open_id = body.get("open_id") or body.get("user", {}).get("open_id")
+            
+            target_id = chat_id
+            if open_id and _get_conversation(open_id):
+                target_id = open_id
+                
+            logger.info("Feishu Card Action click: %r in chat %s, target_id %s", next_query, chat_id, target_id)
+            asyncio.create_task(_process_query(next_query, target_id))
             return {}
 
     # Feishu URL verification
@@ -201,45 +206,228 @@ async def webhook_event(request: Request):
         return {"status": "ok"}
 
     chat_id = get_chat_id(event)
-    asyncio.create_task(_process_query(question, chat_id))
+    chat_type = event.get("message", {}).get("chat_type", "")
+    if chat_type == "p2p":
+        target_id = get_sender_id(event) or chat_id
+    else:
+        target_id = chat_id
+
+    asyncio.create_task(_process_query(question, target_id))
 
     return {"status": "ok"}
 
 
 def extract_thoughts_and_summary(raw_text: str) -> tuple[list[str], str]:
     """Split the raw BQCA summary text into a list of English thought paragraphs
-    and the final Chinese report based on Chinese character density.
-    This prevents English reasoning from leaking into the final report while
-    fully populating the collapsible thinking panel.
+    and the final Chinese report based on explicit section headers (watershed slicing),
+    falling back to post-split density scanning if headers are absent.
+    
+    Includes an intelligent check: if the extracted pre-split "thoughts" section actually
+    contains human-written Chinese content (Chinese characters present with count >= 10),
+    it is correctly recognized as the introductory report paragraph and merged back
+    into the Chinese report rather than being grouped as thought/noise.
     """
     if not raw_text:
         return [], ""
+        
+    # 1. Try to find explicit BQCA report section headers
+    markers = ["【逻辑解释】", "【业务洞察】", "### 【逻辑解释】", "### 【业务洞察】", "###【逻辑解释】", "###【业务洞察】"]
+    first_header_idx = -1
+    for marker in markers:
+        idx = raw_text.find(marker)
+        if idx != -1:
+            if first_header_idx == -1 or idx < first_header_idx:
+                first_header_idx = idx
+                
+    # If a header is found, split exactly before that header
+    if first_header_idx != -1:
+        split_idx = first_header_idx
+    else:
+        # 2. Fallback to post-split density scanner if no headers are present
+        chinese_indices = [m.start() for m in re.finditer(r'[\u4e00-\u9fff]', raw_text)]
+        if not chinese_indices:
+            return [], raw_text
+            
+        split_idx = 0
+        for idx in chinese_indices:
+            sub = raw_text[idx:]
+            if not sub:
+                continue
+            chinese_count = len(re.findall(r'[\u4e00-\u9fff]', sub))
+            density = chinese_count / len(sub)
+            if density >= 0.30:
+                split_idx = idx
+                break
+        else:
+            split_idx = chinese_indices[0]
+        
+    # Clean up split: backtrack past leading markdown, spaces, or headings
+    while split_idx > 0 and raw_text[split_idx-1] in ['#', ' ', '\n', '\r', '*', '-', '【', '`']:
+        split_idx -= 1
+        
+    thoughts_text = raw_text[:split_idx].strip()
+    report_text = raw_text[split_idx:].strip()
     
-    paragraphs = raw_text.split("\n")
-    thoughts = []
-    chinese_paragraphs = []
+    # 3. Double-filter verify the "thoughts" block
+    # Check if the thoughts block is actually part of the Chinese intro report
+    chinese_char_count = len(re.findall(r'[\u4e00-\u9fff]', thoughts_text))
     
-    found_chinese_report = False
+    # If it has more than 10 Chinese characters, it is human introductory text, not SQL draft or English noise.
+    # Exclude lines that are purely SQL formulas (we check if it contains common Chinese report starters)
+    if chinese_char_count >= 10:
+        # Prepend the human-written intro text back to the report text
+        report_text = f"{thoughts_text}\n\n{report_text}".strip()
+        thoughts_text = ""
+        
+    # Convert thoughts block into paragraphs list
+    thoughts = [p.strip() for p in thoughts_text.split("\n") if p.strip()]
+    return thoughts, report_text
+
+
+def clean_technical_lines(text: str) -> str:
+    """Filter out technical database formulas, raw relational planning outputs
+    (like PROJECT, FILTER, JOIN, GROUP BY), and internal SQL syntax markers
+    from the user-facing logical explanation, ensuring it remains 100% human-readable.
+    """
+    if not text:
+        return ""
+        
+    lines = text.split("\n")
+    cleaned_lines = []
     
-    for p in paragraphs:
-        stripped = p.strip()
-        if not stripped:
+    i = 0
+    n = len(lines)
+    
+    def is_technical_line(line: str) -> bool:
+        s = line.strip()
+        if not s:
+            return False
+            
+        # 1. Relational planner and SQL execution keywords
+        upper_words = ["PROJECT", "FILTER", "SELECT", "JOIN", "GROUP BY", "WITH", "EVALUATE", "HAVING", "LIMIT", "ORDER BY", "FROM"]
+        for w in upper_words:
+            if s.startswith(w) or s == w:
+                return True
+                
+        # 2. SQL formula and database function blocks
+        sql_funcs = ["COUNT(", "ROUND(", "SUM(", "AVG(", "COALESCE(", "CASE WHEN", "CASE ", "WHEN ", "THEN ", "ELSE ", "END "]
+        for f in sql_funcs:
+            if f in s:
+                return True
+                
+        # 3. BigQuery project schema references
+        if "webeye-internal-test" in s or "thelook" in s or "order_items" in s or "inventory_items" in s:
+            return True
+            
+        # 4. Pure SQL artifacts
+        if s.startswith("AS ") or s.endswith(" AS") or s == "AS" or " AS " in s:
+            return True
+            
+        # 5. Non-Chinese database query code structures
+        has_chinese = any('\u4e00' <= char <= '\u9fff' for char in s)
+        if not has_chinese:
+            code_symbols = ["_", ".", "(", ")", "=", "*", ">", "<", "`", "AS"]
+            if any(sym in s for sym in code_symbols):
+                if "_" in s or "." in s or "(" in s:
+                    return True
+                    
+        return False
+
+    while i < n:
+        line = lines[i]
+        s = line.strip()
+        
+        # Detect technical headers like "查询逻辑：" or "计算公式：" that precede technical blocks
+        is_tech_header = False
+        tech_headers = ["查询逻辑：", "查询逻辑", "计算公式：", "计算公式", "计算步骤：", "分析步骤：", "分析步骤"]
+        if s in tech_headers or any(s.startswith(th) for th in tech_headers):
+            next_idx = i + 1
+            while next_idx < n and not lines[next_idx].strip():
+                next_idx += 1
+            if next_idx < n and is_technical_line(lines[next_idx]):
+                is_tech_header = True
+                
+        if is_tech_header:
+            i += 1
+            # Skip subsequent technical lines as well
+            while i < n:
+                if not lines[i].strip():
+                    i += 1
+                    continue
+                if is_technical_line(lines[i]):
+                    i += 1
+                else:
+                    break
             continue
             
-        # Calculate Chinese character density
-        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', stripped))
-        ratio = chinese_chars / len(stripped) if len(stripped) > 0 else 0
+        if is_technical_line(line):
+            i += 1
+            continue
+            
+        cleaned_lines.append(line)
+        i += 1
         
-        # If a paragraph has high Chinese density (> 20%), it starts the Chinese report
-        if ratio > 0.20:
-            found_chinese_report = True
-            
-        if found_chinese_report:
-            chinese_paragraphs.append(p)
+    return "\n".join(cleaned_lines).strip()
+
+
+def format_summary_sections(text: str) -> str:
+    """Format the BQCA summary sections to look uniform and highly professional,
+    unifying everything under '业务决策洞察' and removing purely technical '逻辑解释'.
+    """
+    if not text:
+        return ""
+        
+    # Standardize all unbracketed headings to bracketed headings for consistent parsing
+    text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?逻辑解释(?:】|\])?", "【逻辑解释】", text)
+    text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?业务决策洞察(?:】|\])?", "【业务决策洞察】", text)
+    text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?业务洞察(?:】|\])?", "【业务决策洞察】", text)
+    
+    # Scenario 1: Both Logic and Insights are present
+    if "【业务决策洞察】" in text:
+        parts = text.split("【业务决策洞察】")
+        logic_part = parts[0].replace("【逻辑解释】", "").strip()
+        insight_part = parts[1].strip()
+        
+        # Extract the friendly intro opener (everything before '【逻辑解释】' in parts[0])
+        intro_part = ""
+        if "【逻辑解释】" in parts[0]:
+            subparts = parts[0].split("【逻辑解释】")
+            intro_part = subparts[0].strip()
         else:
-            thoughts.append(p)
+            intro_part = logic_part
             
-    return thoughts, "\n\n".join(chinese_paragraphs).strip()
+        formatted = ""
+        if intro_part:
+            formatted += f"{intro_part}\n\n"
+            
+        if insight_part:
+            cleaned_insight = clean_technical_lines(insight_part)
+            if cleaned_insight:
+                formatted += f"**🎯 业务决策洞察：**\n{cleaned_insight}"
+        return formatted.strip()
+        
+    # Scenario 2: Only Logic is present (we relabel it as '业务决策洞察' to unify headings)
+    elif "【逻辑解释】" in text:
+        parts = text.split("【逻辑解释】")
+        intro_part = parts[0].strip()
+        logic_body = parts[1].strip()
+        
+        formatted = ""
+        if intro_part:
+            formatted += f"{intro_part}\n\n"
+            
+        cleaned_logic = clean_technical_lines(logic_body)
+        if cleaned_logic:
+            formatted += f"**🎯 业务决策洞察：**\n{cleaned_logic}"
+        return formatted.strip()
+        
+    # Scenario 3: Neither logic nor insight headers are present (general reports, e.g. forecasting)
+    else:
+        # Pass the entire text through clean_technical_lines so we don't lose anything
+        cleaned_text = clean_technical_lines(text).strip()
+        if cleaned_text and not cleaned_text.startswith("**🎯"):
+            return f"**🎯 业务决策洞察：**\n{cleaned_text}"
+        return cleaned_text
 
 
 async def _process_query(question: str, chat_id: str):
@@ -263,18 +451,25 @@ async def _process_query(question: str, chat_id: str):
         if thoughts:
             result.thinking_process.extend(thoughts)
 
+        # Ensure result.recommended_questions has fallback smart e-commerce questions if BQCA returned empty
+        if not result.recommended_questions:
+            result.recommended_questions = [
+                "各订单状态的占比情况",
+                "分析近一年销售额 Top 5 的国家",
+                "查询退货数最高的前 5 类商品"
+            ]
+
+        # Format Chinese summary headings nicely
+        formatted_summary = format_summary_sections(summary)
+
+        # Generate and upload HTML interactive report is disabled per user request
+        result_url = None
+
         if not result.rows and not result.vega_config:
-            await send_premium_result_card(chat_id, question, result, summary or "未查询到相关数据，请换个说法试试。")
+            await send_premium_result_card(chat_id, question, result, formatted_summary or "未查询到相关数据，请换个说法试试。", result_url=result_url)
             return
 
-        # TODO: HTML 生成暂时注释，直接发送文本结果
-        # html = build_result_html(question, result)
-        # query_id = generate_query_id()
-        # url = await upload_html(query_id, html)
-        # logger.info("Result URL: %s", url)
-        # await send_result_card(chat_id, result.summary or "查询完成，点击查看详情。", url)
-
-        await send_premium_result_card(chat_id, question, result, summary or "查询完成。")
+        await send_premium_result_card(chat_id, question, result, formatted_summary or "查询完成。", result_url=result_url)
 
     except Exception as e:
         logger.error("Query processing failed: %s", e, exc_info=True)
