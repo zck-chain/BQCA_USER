@@ -41,6 +41,14 @@ def init_db() -> None:
                 last_active REAL NOT NULL
             )
         """)
+        
+        # 4. Chat room types registry table (Group vs P2P)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_room_types (
+                chat_id TEXT PRIMARY KEY,
+                chat_type TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 # ---------------------------------------------------------------------------
@@ -203,3 +211,29 @@ def cleanup_expired_sessions(ttl: float) -> None:
             )
     except Exception as e:
         logger.error("Failed to run periodic SQLite cleanup: %s", e)
+
+
+def save_chat_type(chat_id: str, chat_type: str) -> None:
+    """Save the chat room type (e.g. 'p2p' or 'group') to prevent cross-channel hijackings."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO chat_room_types (chat_id, chat_type) VALUES (?, ?)",
+                (chat_id, chat_type)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error("Failed to save chat type for %s: %s", chat_id, e)
+
+
+def get_chat_type(chat_id: str) -> str | None:
+    """Retrieve the stored chat room type ('p2p' or 'group'), or None if not registered."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT chat_type FROM chat_room_types WHERE chat_id = ?", (chat_id,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        logger.error("Failed to get chat type for %s: %s", chat_id, e)
+        return None

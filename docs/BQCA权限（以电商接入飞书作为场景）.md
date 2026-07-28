@@ -186,7 +186,7 @@ BQCA API 执行 SQL 时使用的身份**不是调用者本身**，而是由 BQCA
 **验证过程**：
 
 1. 在 `thelook_bq.orders` 上创建两个 RAP：
-   - `shipped_only`：grant 给 `bqca-restricted`，过滤 `status = 'Shipped'`
+   - `shipped_only`：grant 给 `bqca-restricted`，当前过滤美国区域客户订单（策略名是历史遗留）
    - `admin_all_rows`：grant 给 `user:chengkang.zhao@webeye.com`，`FILTER USING (TRUE)`
 
 2. Admin key 通过 BQCA API 查询 orders → **0 行**！
@@ -195,17 +195,23 @@ BQCA API 执行 SQL 时使用的身份**不是调用者本身**，而是由 BQCA
 
 3. 把 `bqca-runner` 加到 `admin_all_rows` 的 grantee 后：
    - Admin key → **5 种状态，全部数据**（Shipped 37500, Complete 31109, Processing 24813, Cancelled 18571, Returned 12640）
-   - Restricted key → **1 种状态**（Shipped 37500）
+   - Restricted key → **美国区域内的 5 种状态**（示例：Shipped 8405, Complete 6856, Processing 5595, Cancelled 4195, Returned 2849）
    - 行级权限生效！
 
 **正确的 RAP 配置方式**：
 
 ```sql
--- 受限用户：只能看 Shipped
+-- 受限用户：只能看美国区域客户订单；shipped_only 是历史策略名
 CREATE OR REPLACE ROW ACCESS POLICY shipped_only
 ON `project.dataset.table`
 GRANT TO ("serviceAccount:bqca-restricted@webeye-internal-test.iam.gserviceaccount.com")
-FILTER USING (status = 'Shipped');
+FILTER USING (
+  user_id IN (
+    SELECT id
+    FROM `project.dataset.users`
+    WHERE country = "United States"
+  )
+);
 
 -- 管理员：全量访问（必须包含 bqca-runner，因为 admin key 不走 impersonation，BQCA 用 bqca-runner 执行 SQL）
 CREATE OR REPLACE ROW ACCESS POLICY admin_all_rows
@@ -227,7 +233,7 @@ FILTER USING (TRUE);
 | API Key | 身份 | orders 状态数 | order_items 状态数 | 行级权限 |
 |---------|------|--------------|-------------------|----------|
 | ${BQCA_MANAGER_API_KEY} | bqca-runner（default） | 5 种（全量） | 5 种（全量） | admin_all_rows 生效 |
-| ${BQCA_SUPPORT_API_KEY} | bqca-restricted（impersonated） | 1 种（Shipped only） | 1 种（Shipped only） | shipped_only 生效 |
+| ${BQCA_SUPPORT_API_KEY} | bqca-restricted（impersonated） | 5 种（仅 United States 区域） | 5 种（仅 United States 区域） | shipped_only 生效，过滤条件为美国区域客户 |
 
 ```sql
 -- 给需要全量访问的用户加全量行权限
@@ -365,8 +371,8 @@ gcloud run deploy bqca-bot ... --set-env-vars="API_KEY=${BQCA_MANAGER_API_KEY},.
 - `ecommerce-analyst-cn`：`dataAgentUser`
 
 **行级权限（RAP）**：
-- `thelook_bq.orders` → `shipped_only`（grantee，FILTER USING status = 'Shipped'）
-- `thelook_bq.order_items` → `shipped_only`（grantee，FILTER USING status = 'Shipped'）
+- `thelook_bq.orders` → `shipped_only`（grantee，FILTER USING `users.country = "United States"` 对应的 `user_id`）
+- `thelook_bq.order_items` → `shipped_only`（grantee，FILTER USING `users.country = "United States"` 对应的 `user_id`）
 
 **Impersonation**：
 - `bqca-runner` 可 impersonate `bqca-restricted`（`serviceAccountTokenCreator`）
@@ -379,7 +385,7 @@ gcloud run deploy bqca-bot ... --set-env-vars="API_KEY=${BQCA_MANAGER_API_KEY},.
 | 场景 | 使用身份 | 需要的权限链 | 当前效果 |
 |------|----------|--------------|----------|
 | 运营经理通过 manager key 查询 | Cloud Run 默认身份 `bqca-runner` | `cloudaicompanion.user` + Agent `dataAgentUser` + BigQuery Admin / 数据读取权限 + `admin_all_rows` RAP | 可查全量订单状态、全量订单明细和其他数据源 |
-| 一线客服通过 support key 查询 | Cloud Run impersonate `bqca-restricted` | `cloudaicompanion.user` + Agent `dataAgentUser` + `bigquery.jobUser` + 数据集 READER + `shipped_only` RAP + TokenCreator | 当前仅可看 `orders` / `order_items` 中 `status = 'Shipped'` 的行 |
+| 一线客服通过 support key 查询 | Cloud Run impersonate `bqca-restricted` | `cloudaicompanion.user` + Agent `dataAgentUser` + `bigquery.jobUser` + 数据集 READER + `shipped_only` RAP + TokenCreator | 当前仅可看 `orders` / `order_items` 中美国区域客户对应的行 |
 | 新增一个受限 SA | 新 SA | 同 support key：项目级 CA + Agent User + JobUser + 数据集读权限 + RAP grantee + TokenCreator + API Key 映射 | 能否看哪些表由数据集/表权限决定；能看哪些行由 RAP 决定 |
 
 ## 实测问题与解决方案汇总
@@ -463,7 +469,7 @@ curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
 
 验证 RAP 是否按 key 过滤行数据（同一个问题，两个 key 结果不同）：
 
-**1. orders 表行级权限（shipped_only RAP：status = 'Shipped'）：**
+**1. orders 表行级权限（shipped_only RAP：美国区域客户订单）：**
 
 ```bash
 # Admin key — 预期：5 种状态（Shipped 37500, Complete 31109, Processing 24813, Cancelled 18571, Returned 12640）
@@ -472,14 +478,30 @@ curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
   -H "Content-Type: application/json" \
   -d '{"question": "查看所有订单的状态分布"}'
 
-# Restricted key — 预期：仅 Shipped（37500）
+# Restricted key — 预期：仍有 5 种状态，但只统计 United States 区域订单
 curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
   -H "X-API-Key: ${BQCA_SUPPORT_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"question": "查看所有订单的状态分布"}'
 ```
 
-**2. order_items 表行级权限（shipped_only RAP：status = 'Shipped'）：**
+**2. 国家维度隔离验证（同一问题，不同权限）：**
+
+```bash
+# Admin key — 预期：能看到多个国家的订单量和销售额
+curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
+  -H "X-API-Key: ${BQCA_MANAGER_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "按国家统计订单量和销售额"}'
+
+# Restricted key — 预期：只能看到 United States，不能看到其他国家
+curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
+  -H "X-API-Key: ${BQCA_SUPPORT_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "按国家统计订单量和销售额"}'
+```
+
+**3. order_items 表行级权限（shipped_only RAP：美国区域客户订单明细）：**
 
 ```bash
 # Admin key — 预期：5 种状态
@@ -488,14 +510,14 @@ curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
   -H "Content-Type: application/json" \
   -d '{"question": "订单明细中每个状态有多少条"}'
 
-# Restricted key — 预期：仅 Shipped
+# Restricted key — 预期：仍有 5 种状态，但只统计 United States 区域订单明细
 curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
   -H "X-API-Key: ${BQCA_SUPPORT_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"question": "订单明细中每个状态有多少条"}'
 ```
 
-**3. 跨表关联查询行级权限（orders + order_items JOIN）：**
+**4. 跨表关联查询行级权限（orders + order_items JOIN）：**
 
 ```bash
 # Admin key — 预期：所有状态完整关联
@@ -504,7 +526,7 @@ curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
   -H "Content-Type: application/json" \
   -d '{"question": "每个订单状态对应的订单明细总金额"}'
 
-# Restricted key — 预期：仅 Shipped 状态的关联结果
+# Restricted key — 预期：仅 United States 区域客户的关联结果
 curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
   -H "X-API-Key: ${BQCA_SUPPORT_API_KEY}" \
   -H "Content-Type: application/json" \
@@ -515,10 +537,11 @@ curl -s -X POST https://bqca-bot-839062387451.asia-east1.run.app/api/query \
 
 | 维度 | Admin key | Restricted key |
 |------|-----------|----------------|
-| orders 状态种类 | 5 种 | 1 种（Shipped only） |
-| order_items 状态种类 | 5 种 | 1 种（Shipped only） |
-| 跨表 JOIN 结果 | 全量关联 | 仅 Shipped 关联 |
-| RAP 策略 | admin_all_rows（TRUE） | shipped_only（status = 'Shipped'） |
+| orders 状态种类 | 5 种，全量订单 | 5 种，仅 United States 区域 |
+| order_items 状态种类 | 5 种，全量订单明细 | 5 种，仅 United States 区域 |
+| 国家维度结果 | 多国家结果 | 仅 United States |
+| 跨表 JOIN 结果 | 全量关联 | 仅 United States 区域关联 |
+| RAP 策略 | admin_all_rows（TRUE） | shipped_only（历史策略名，当前过滤美国区域客户） |
 
 ## 快速配置清单（新增 SA 时按序执行）
 

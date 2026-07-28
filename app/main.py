@@ -24,12 +24,14 @@ from app.storage.sqlite import (
     save_role_session,
     clear_role_conversation,
     cleanup_expired_sessions,
+    save_chat_type,
+    get_chat_type,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SESSION_TTL = 1800  # 30 minutes
+SESSION_TTL = 86400 * 30  # 30 days
 
 DEMO_ROLES = {"运营经理", "一线客服"}
 ROLE_ALIASES = {
@@ -172,21 +174,46 @@ async def api_query(request: Request):
 async def webhook_event(request: Request):
     body = await request.json()
 
+    # Extract event payload (could be in top-level body or nested under body["event"])
+    event_payload = body.get("event") if isinstance(body.get("event"), dict) else body
+    if not event_payload:
+        event_payload = body
+
     # Handle Feishu Card Action Event (One-click quick query)
-    if "action" in body and "open_chat_id" in body:
-        action_val = body["action"].get("value", {})
+    action_data = event_payload.get("action") or body.get("action")
+    if action_data and isinstance(action_data, dict):
+        action_val = action_data.get("value", {})
         if action_val.get("action") == "quick_query":
             next_query = action_val.get("query")
-            chat_id = body.get("open_chat_id")
-            open_id = body.get("open_id") or body.get("user", {}).get("open_id")
+            # Extract chat_id from payload top-level or context
+            chat_id = event_payload.get("open_chat_id") or event_payload.get("context", {}).get("open_chat_id")
+            # Extract open_id from payload top-level, user, or operator
+            open_id = (
+                event_payload.get("open_id") or 
+                event_payload.get("user", {}).get("open_id") or 
+                event_payload.get("operator", {}).get("open_id")
+            )
             
-            target_id = chat_id
-            if open_id and _get_conversation(open_id):
-                target_id = open_id
+            if chat_id:
+                target_id = chat_id
                 
-            logger.info("Feishu Card Action click: %r in chat %s, target_id %s", next_query, chat_id, target_id)
-            asyncio.create_task(_process_query(next_query, target_id))
-            return {}
+                # Check stored chat room type (P2P vs Group) to prevent cross-channel hijackings
+                stored_chat_type = get_chat_type(chat_id)
+                if stored_chat_type == "p2p":
+                    if open_id:
+                        target_id = open_id
+                elif stored_chat_type == "group":
+                    target_id = chat_id
+                else:
+                    # Fallback if SQLite record is absent (database cleared)
+                    if open_id and _get_conversation(open_id) and not _get_conversation(chat_id):
+                        target_id = open_id
+                    
+                logger.info("Feishu Card Action click: %r in chat %s, target_id %s", next_query, chat_id, target_id)
+                asyncio.create_task(_process_query(next_query, target_id))
+                return {}
+
+
 
     # Feishu URL verification
     if body.get("type") == "url_verification":
@@ -207,6 +234,9 @@ async def webhook_event(request: Request):
 
     chat_id = get_chat_id(event)
     chat_type = event.get("message", {}).get("chat_type", "")
+    if chat_id and chat_type:
+        save_chat_type(chat_id, chat_type)
+
     if chat_type == "p2p":
         target_id = get_sender_id(event) or chat_id
     else:
@@ -331,7 +361,18 @@ def clean_technical_lines(text: str) -> str:
                 if "_" in s or "." in s or "(" in s:
                     return True
                     
+        # 6. Chinese SQL translation and step-by-step description markers
+        tech_words = [
+            "筛选出", "进行分组", "指标聚合", "时间区间", "字段", "数据表", "多表关联",
+            "进行过滤", "表进行", "逻辑解释", "分析步骤", "计算步骤", "查询逻辑", "排序",
+            "聚合计算", "筛选条件", "按年龄段", "时间筛选", "订单创建时间"
+        ]
+        for tw in tech_words:
+            if tw in s:
+                return True
+                
         return False
+
 
     while i < n:
         line = lines[i]
@@ -382,52 +423,103 @@ def format_summary_sections(text: str) -> str:
     text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?业务决策洞察(?:】|\])?", "【业务决策洞察】", text)
     text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?业务洞察(?:】|\])?", "【业务决策洞察】", text)
     
-    # Scenario 1: Both Logic and Insights are present
-    if "【业务决策洞察】" in text:
-        parts = text.split("【业务决策洞察】")
-        logic_part = parts[0].replace("【逻辑解释】", "").strip()
-        insight_part = parts[1].strip()
-        
-        # Extract the friendly intro opener (everything before '【逻辑解释】' in parts[0])
-        intro_part = ""
-        if "【逻辑解释】" in parts[0]:
-            subparts = parts[0].split("【逻辑解释】")
-            intro_part = subparts[0].strip()
+    # Initialize sections
+    intro_part = ""
+    logic_part = ""
+    insight_part = ""
+    
+    # Locate section markers
+    idx_logic = text.find("【逻辑解释】")
+    idx_insight = text.find("【业务决策洞察】")
+    
+    if idx_logic != -1 and idx_insight != -1:
+        if idx_logic < idx_insight:
+            # Logic comes before Insight (Standard order)
+            intro_part = text[:idx_logic].strip()
+            logic_part = text[idx_logic + len("【逻辑解释】"):idx_insight].strip()
+            insight_part = text[idx_insight + len("【业务决策洞察】"):].strip()
         else:
-            intro_part = logic_part
-            
-        formatted = ""
-        if intro_part:
-            formatted += f"{intro_part}\n\n"
-            
-        if insight_part:
-            cleaned_insight = clean_technical_lines(insight_part)
-            if cleaned_insight:
-                formatted += f"**🎯 业务决策洞察：**\n{cleaned_insight}"
-        return formatted.strip()
-        
-    # Scenario 2: Only Logic is present (we relabel it as '业务决策洞察' to unify headings)
-    elif "【逻辑解释】" in text:
-        parts = text.split("【逻辑解释】")
-        intro_part = parts[0].strip()
-        logic_body = parts[1].strip()
-        
-        formatted = ""
-        if intro_part:
-            formatted += f"{intro_part}\n\n"
-            
-        cleaned_logic = clean_technical_lines(logic_body)
-        if cleaned_logic:
-            formatted += f"**🎯 业务决策洞察：**\n{cleaned_logic}"
-        return formatted.strip()
-        
-    # Scenario 3: Neither logic nor insight headers are present (general reports, e.g. forecasting)
+            # Insight comes before Logic (Inverted order)
+            intro_part = text[:idx_insight].strip()
+            insight_part = text[idx_insight + len("【业务决策洞察】"):idx_logic].strip()
+            logic_part = text[idx_logic + len("【逻辑解释】"):].strip()
+    elif idx_logic != -1:
+        # Only Logic is present
+        intro_part = text[:idx_logic].strip()
+        logic_part = text[idx_logic + len("【逻辑解释】"):].strip()
+    elif idx_insight != -1:
+        # Only Insight is present
+        intro_part = text[:idx_insight].strip()
+        insight_part = text[idx_insight + len("【业务决策洞察】"):].strip()
     else:
-        # Pass the entire text through clean_technical_lines so we don't lose anything
-        cleaned_text = clean_technical_lines(text).strip()
-        if cleaned_text and not cleaned_text.startswith("**🎯"):
-            return f"**🎯 业务决策洞察：**\n{cleaned_text}"
-        return cleaned_text
+        # Neither is present, treat the entire block as raw summary text
+        insight_part = text
+
+    # Clean sections
+    cleaned_insight = clean_technical_lines(insight_part).strip()
+    cleaned_logic = clean_technical_lines(logic_part).strip()
+    
+    # Standardize placeholder filtering (e.g. if LLM returned empty bullets, dots or stars)
+    for placeholder in ["•", "*", "-", ".", ""]:
+        if cleaned_insight == placeholder:
+            cleaned_insight = ""
+        if cleaned_logic == placeholder:
+            cleaned_logic = ""
+
+    # Clean up LaTeX artifacts in all sections (Feishu cards do not render LaTeX!)
+    def clean_latex(s: str) -> str:
+        if not s:
+            return ""
+        # Replace mathematical LaTeX symbols with elegant unicode equivalents
+        s = s.replace(r"\ge", " ≥ ").replace(r"\\ge", " ≥ ")
+        s = s.replace(r"\le", " ≤ ").replace(r"\\le", " ≤ ")
+        s = s.replace(r"\times", " × ").replace(r"\\times", " × ")
+        s = s.replace(r"\approx", " ≈ ").replace(r"\\approx", " ≈ ")
+        s = s.replace(r"\%", "%").replace(r"\\%", "%")
+        s = s.replace(r"\$", "$").replace(r"\\$", "$")
+        # Strip remaining dollar signs used for mathematical rendering (e.g. $ \ge 20 $ or $\ge 20$)
+        s = re.sub(r"\$\s*([≥≤≈a-zA-Z0-9%\s]+)\s*\$", r"\1", s)
+        # Strip stray dollar signs or backslashes
+        s = s.replace("$", "").replace("\\", "")
+        # Standardize multiple horizontal spaces
+        s = re.sub(r"[ \t]+", " ", s)
+        # Collapse multiple empty lines
+        s = re.sub(r"\n\s*\n+", "\n\n", s)
+        # Fix layout of bullets that were mathematically unescaped
+        s = s.replace(" 件 。", "件。").replace(" % ) 。", "%)。").replace(" % ", "%")
+        return s.strip()
+
+    cleaned_insight = clean_latex(cleaned_insight)
+    cleaned_logic = clean_latex(cleaned_logic)
+    intro_part = clean_latex(intro_part)
+
+    # Assemble final output with unified heading AT THE VERY TOP
+    formatted = "**🎯 业务决策洞察：**\n"
+    
+    # Process friendly opener intro
+    if intro_part:
+        cleaned_intro = clean_technical_lines(intro_part).strip()
+        # Filter out trailing punctuation or transitions if they end abruptly
+        if cleaned_intro and (cleaned_intro.endswith("如下：") or cleaned_intro.endswith("如下")):
+            cleaned_intro = cleaned_intro.rstrip("：").rstrip(":")[:-2] + "已生成并为您展示在下方列表。"
+        elif cleaned_intro and cleaned_intro.endswith("结果与"):
+            cleaned_intro = cleaned_intro[:-3] + "已生成并为您展示在下方列表。"
+        if cleaned_intro:
+            formatted += f"{cleaned_intro}\n\n"
+            
+    # Process business decision insights section
+    if cleaned_insight:
+        formatted += f"{cleaned_insight}"
+    else:
+        # If no actual insight was generated (or was skipped by BQCA due to heavy row lists),
+        # output a premium, high-fidelity business summary instead of leaking technical SQL steps!
+        formatted += (
+            "📊 数据已成功为您提取并生成上方报表。本次查询包含的数据样本较多、交叉维度较广，"
+            "为了协助您提炼更精准的运营决策动作，建议点击下方【快捷追问深度分析】按钮，进行更精细、更针对性的商业维度下钻分析。"
+        )
+        
+    return formatted.strip()
+
 
 
 async def _process_query(question: str, chat_id: str):
