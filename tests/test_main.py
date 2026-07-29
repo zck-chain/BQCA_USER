@@ -126,9 +126,35 @@ def test_feishu_query_reuses_session_role_and_allows_switching():
   ]
   assert mock_chat.call_args_list[0].args == ("商品状态分布", None)
   assert mock_chat.call_args_list[0].kwargs == {
-      "target_service_account": "support-test-sa"
+      "target_service_account": "support-test-sa",
+      "agent_id": "ecommerce-analyst-cn",
+      "location": "global",
   }
   assert mock_chat.call_args_list[1].args == ("查看已完成订单", None)
   assert mock_chat.call_args_list[1].kwargs == {
-      "target_service_account": None
+      "target_service_account": None,
+      "agent_id": "ecommerce-analyst-cn",
+      "location": "global",
   }
+
+
+def test_game_agent_routing():
+    game_result = MagicMock(
+        summary="游戏活跃度正常",
+        sql="SELECT 1",
+        fields=["玩家数"],
+        rows=[{"玩家数": 1000}],
+        vega_config=None,
+        conversation_name="conversations/game-1",
+    )
+    with patch("app.main.chat", return_value=game_result) as mock_chat:
+        resp = client.post("/api/query", json={
+            "question": "游戏玩家活跃度",
+            "role": "运营经理",
+            "domain": "game",
+        })
+
+    assert resp.status_code == 200
+    assert mock_chat.call_args_list[0].kwargs["agent_id"] == "game-analyst-cn"
+    assert mock_chat.call_args_list[0].kwargs["location"] == "global"
+

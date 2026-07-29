@@ -6,28 +6,33 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_tenant_token: str | None = None
+def _resolve_bot_credentials(app_id: str | None = None) -> tuple[str, str]:
+    if app_id and settings.GAME_FEISHU_APP_ID and app_id == settings.GAME_FEISHU_APP_ID:
+        return settings.GAME_FEISHU_APP_ID, settings.GAME_FEISHU_APP_SECRET
+    return settings.FEISHU_APP_ID, settings.FEISHU_APP_SECRET
 
 
-async def _get_tenant_token() -> str:
-  """Get Feishu tenant_access_token."""
-  global _tenant_token
-  async with httpx.AsyncClient(timeout=20.0) as client:
-      resp = await client.post(
-          "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-          json={
-              "app_id": settings.FEISHU_APP_ID,
-              "app_secret": settings.FEISHU_APP_SECRET,
-          },
-      )
-      data = resp.json()
-      _tenant_token = data["tenant_access_token"]
-      return _tenant_token
+async def _get_tenant_token(app_id: str | None = None, app_secret: str | None = None) -> str:
+    """Get Feishu tenant_access_token for specific bot credentials."""
+    target_id, target_secret = app_id, app_secret
+    if not target_id or not target_secret:
+        target_id, target_secret = _resolve_bot_credentials(app_id)
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            json={
+                "app_id": target_id,
+                "app_secret": target_secret,
+            },
+        )
+        data = resp.json()
+        return data.get("tenant_access_token", "")
 
 
-async def send_text_message(chat_id: str, text: str) -> dict:
+async def send_text_message(chat_id: str, text: str, app_id: str | None = None) -> dict:
   """Send plain text message."""
-  token = await _get_tenant_token()
+  token = await _get_tenant_token(app_id=app_id)
   receive_id_type = "open_id" if chat_id.startswith("ou_") else "chat_id"
   payload = {
       "receive_id": chat_id,
@@ -50,9 +55,9 @@ async def send_text_message(chat_id: str, text: str) -> dict:
       return resp_json
 
 
-async def send_result_card(chat_id: str, summary: str, result_url: str) -> dict:
+async def send_result_card(chat_id: str, summary: str, result_url: str, app_id: str | None = None) -> dict:
   """Send result card with summary and detail link."""
-  token = await _get_tenant_token()
+  token = await _get_tenant_token(app_id=app_id)
   receive_id_type = "open_id" if chat_id.startswith("ou_") else "chat_id"
   card_content = {
       "elements": [
@@ -77,17 +82,9 @@ async def send_result_card(chat_id: str, summary: str, result_url: str) -> dict:
       return resp.json()
 
 
-async def send_premium_result_card(chat_id: str, question: str, result, cleaned_summary: str, result_url: str | None = None) -> dict:
-    """Send high-quality interactive message card (lark v2 card) with:
-    - Custom indigo AI theme header
-    - User's natural language question
-    - Collapsible panel for thinking processes (if present)
-    - Cleaned Chinese business insights (summary)
-    - Collapsible panel for generated SQL code blocks
-    - Dynamic Markdown table for row results
-    - Interactive action buttons for recommended follow-up questions
-    """
-    token = await _get_tenant_token()
+async def send_premium_result_card(chat_id: str, question: str, result, cleaned_summary: str, result_url: str | None = None, app_id: str | None = None) -> dict:
+    """Send high-quality interactive message card (lark v2 card)."""
+    token = await _get_tenant_token(app_id=app_id)
 
     elements = []
 

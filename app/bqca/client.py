@@ -35,12 +35,15 @@ class ChatResult:
     recommended_questions: list[str] = field(default_factory=list)
 
 
-def _agent_path() -> str:
-    return f"projects/{settings.GCP_PROJECT}/locations/{settings.CA_LOCATION}/dataAgents/{settings.CA_AGENT_ID}"
+def _agent_path(agent_id: str | None = None, location: str | None = None) -> str:
+    agent = agent_id or settings.CA_AGENT_ID
+    loc = location or settings.CA_LOCATION
+    return f"projects/{settings.GCP_PROJECT}/locations/{loc}/dataAgents/{agent}"
 
 
-def _parent_path() -> str:
-    return f"projects/{settings.GCP_PROJECT}/locations/{settings.CA_LOCATION}"
+def _parent_path(location: str | None = None) -> str:
+    loc = location or settings.CA_LOCATION
+    return f"projects/{settings.GCP_PROJECT}/locations/{loc}"
 
 
 def _get_credentials(target_sa: str | None = None):
@@ -82,17 +85,17 @@ def _get_client(credentials=None) -> geminidataanalytics.DataChatServiceClient:
     return geminidataanalytics.DataChatServiceClient(credentials=credentials)
 
 
-def create_conversation(credentials=None) -> str:
+def create_conversation(credentials=None, agent_id: str | None = None, location: str | None = None) -> str:
     """Create a new CA API conversation and return its resource name."""
     client = _get_client(credentials)
     conversation = geminidataanalytics.Conversation()
-    conversation.agents = [_agent_path()]
+    conversation.agents = [_agent_path(agent_id, location)]
     req = geminidataanalytics.CreateConversationRequest(
-        parent=_parent_path(),
+        parent=_parent_path(location),
         conversation=conversation,
     )
     convo = client.create_conversation(request=req)
-    logger.info("Created conversation: %s", convo.name)
+    logger.info("Created conversation: %s for agent: %s (loc=%s)", convo.name, agent_id or settings.CA_AGENT_ID, location or settings.CA_LOCATION)
     return convo.name
 
 
@@ -108,11 +111,14 @@ def _is_noise(text: str) -> bool:
 
 
 def chat(question: str, conversation_name: str | None = None,
-         target_service_account: str | None = None) -> ChatResult:
+         target_service_account: str | None = None,
+         agent_id: str | None = None,
+         location: str | None = None) -> ChatResult:
     """
     Send a question to the BQCA agent via the Conversational Analytics API.
     If conversation_name is None, a new conversation is created (single-turn).
     If target_service_account is provided, impersonate it for the call.
+    If agent_id or location is provided, route the call to the specified BQCA data agent and GCP region.
     Returns a ChatResult with summary, SQL, data rows, and optional chart.
     """
     credentials = _get_credentials(target_service_account)
@@ -120,15 +126,15 @@ def chat(question: str, conversation_name: str | None = None,
     chat_client = _get_client(credentials)
 
     if conversation_name is None:
-        conversation_name = create_conversation(credentials)
+        conversation_name = create_conversation(credentials, agent_id=agent_id, location=location)
 
     user_msg = geminidataanalytics.Message(user_message={"text": question})
     convo_ref = geminidataanalytics.ConversationReference()
     convo_ref.conversation = conversation_name
-    convo_ref.data_agent_context.data_agent = _agent_path()
+    convo_ref.data_agent_context.data_agent = _agent_path(agent_id, location)
 
     req = geminidataanalytics.ChatRequest(
-        parent=_parent_path(),
+        parent=_parent_path(location),
         messages=[user_msg],
         conversation_reference=convo_ref,
     )
@@ -194,15 +200,18 @@ def chat(question: str, conversation_name: str | None = None,
     return result
 
 
-# TODO: 让 BQCA 生成前端 HTML 代码，从 summary 中提取并直接上传
-# def extract_html_from_summary(summary: str) -> str | None:
-#     """Extract HTML code block from BQCA summary text.
-#
-#     Looks for ```html ... ``` blocks. Returns the HTML content or None.
-#     """
-#     import re
-#     pattern = re.compile(r"```html\s*\n(.*?)```", re.DOTALL)
-#     match = pattern.search(summary)
-#     if match:
-#         return match.group(1).strip()
-#     return None
+def extract_html_from_summary(summary: str) -> tuple[str | None, str]:
+    """Extract ```html ... ``` code block generated natively by BQCA.
+
+    Returns (html_code, clean_summary_without_html_block).
+    """
+    if not summary:
+        return None, ""
+    pattern = re.compile(r"```html\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+    match = pattern.search(summary)
+    if match:
+        html_code = match.group(1).strip()
+        clean_summary = pattern.sub("", summary).strip()
+        return html_code, clean_summary
+    return None, summary
+
