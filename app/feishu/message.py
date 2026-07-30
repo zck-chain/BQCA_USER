@@ -53,7 +53,159 @@ async def upload_image(image_bytes: bytes, app_id: str | None = None) -> str | N
             return None
 
 
-def _optimize_vega_spec(spec: dict) -> dict:
+def vega_to_vchart(spec: dict) -> dict | None:
+    """Convert Vega-Lite JSON spec into Feishu VChart spec dictionary.
+
+    Returns VChart spec dict if converted successfully, or None for fallback.
+    """
+    if not isinstance(spec, dict):
+        return None
+
+    try:
+        raw_title = spec.get("title")
+        title_text = ""
+        if isinstance(raw_title, str):
+            title_text = raw_title
+        elif isinstance(raw_title, dict):
+            title_text = raw_title.get("text", "")
+
+        title_cfg = {"text": title_text, "visible": bool(title_text)}
+
+        values = spec.get("data", {}).get("values", [])
+        if not values and "hconcat" in spec and isinstance(spec["hconcat"], list):
+            for sub in spec["hconcat"]:
+                if isinstance(sub, dict) and sub.get("data", {}).get("values"):
+                    values = sub["data"]["values"]
+                    break
+
+        if not values:
+            return None
+
+        data_spec = [{"id": "data", "values": values}]
+
+        mark = spec.get("mark")
+        mark_type = mark.get("type", mark) if isinstance(mark, dict) else mark
+
+        # 1. Bar Chart
+        if mark_type in ["bar", "rect"]:
+            enc = spec.get("encoding", {})
+            x_field = enc.get("x", {}).get("field")
+            y_field = enc.get("y", {}).get("field")
+            color_field = enc.get("color", {}).get("field")
+            if not x_field or not y_field:
+                return None
+            vchart = {
+                "type": "bar",
+                "title": title_cfg,
+                "data": data_spec,
+                "xField": x_field,
+                "yField": y_field,
+            }
+            if color_field:
+                vchart["seriesField"] = color_field
+                vchart["stack"] = False
+            return vchart
+
+        # 1.5. Area Chart
+        elif mark_type == "area":
+            enc = spec.get("encoding", {})
+            x_field = enc.get("x", {}).get("field")
+            y_field = enc.get("y", {}).get("field")
+            color_field = enc.get("color", {}).get("field")
+            if not x_field or not y_field:
+                return None
+            vchart = {
+                "type": "area",
+                "title": title_cfg,
+                "data": data_spec,
+                "xField": x_field,
+                "yField": y_field,
+            }
+            if color_field:
+                vchart["seriesField"] = color_field
+            return vchart
+
+        # 2. Line Chart
+        elif mark_type in ["line", "trail"]:
+            enc = spec.get("encoding", {})
+            x_field = enc.get("x", {}).get("field")
+            y_field = enc.get("y", {}).get("field")
+            color_field = enc.get("color", {}).get("field")
+            if not x_field or not y_field:
+                return None
+            vchart = {
+                "type": "line",
+                "title": title_cfg,
+                "data": data_spec,
+                "xField": x_field,
+                "yField": y_field,
+            }
+            if color_field:
+                vchart["seriesField"] = color_field
+            return vchart
+
+        # 3. Pie / Arc / Donut Chart
+        elif mark_type in ["arc", "pie"]:
+            enc = spec.get("encoding", {})
+            val_field = enc.get("theta", {}).get("field") or enc.get("y", {}).get("field")
+            cat_field = enc.get("color", {}).get("field") or enc.get("x", {}).get("field")
+            if not val_field or not cat_field:
+                return None
+            
+            # Read innerRadius from mark dictionary or title to support Ring/Donut charts dynamically
+            inner_val = 0
+            if isinstance(mark, dict):
+                inner_val = mark.get("innerRadius", 0)
+                if inner_val > 1:
+                    inner_val = 0.5
+            if "环形" in title_text or "donut" in title_text.lower() or "ring" in title_text.lower():
+                inner_val = 0.5
+
+            return {
+                "type": "pie",
+                "title": title_cfg,
+                "data": data_spec,
+                "valueField": val_field,
+                "categoryField": cat_field,
+                "outerRadius": 0.8,
+                "innerRadius": inner_val,
+                "label": {
+                    "visible": True
+                },
+                "legend": {
+                    "visible": True,
+                    "orient": "bottom"
+                }
+            }
+
+        # 4. Handle hconcat (Horizontal concat)
+        elif "hconcat" in spec and isinstance(spec["hconcat"], list) and len(spec["hconcat"]) >= 2:
+            sub1 = spec["hconcat"][0]
+            sub2 = spec["hconcat"][1]
+            enc1 = sub1.get("encoding", {}) if isinstance(sub1, dict) else {}
+            enc2 = sub2.get("encoding", {}) if isinstance(sub2, dict) else {}
+            x1, y1 = enc1.get("x", {}).get("field"), enc1.get("y", {}).get("field")
+            x2, y2 = enc2.get("x", {}).get("field"), enc2.get("y", {}).get("field")
+            if x1 and y1 and x2 and y2:
+                return {
+                    "type": "common",
+                    "title": title_cfg,
+                    "data": data_spec,
+                    "layout": {"type": "grid", "col": 2, "row": 1},
+                    "region": [
+                        {"id": "region1", "gridRow": 0, "gridCol": 0},
+                        {"id": "region2", "gridRow": 0, "gridCol": 1},
+                    ],
+                    "series": [
+                        {"type": "bar", "regionId": "region1", "xField": x1, "yField": y1},
+                        {"type": "bar", "regionId": "region2", "xField": x2, "yField": y2},
+                    ],
+                }
+
+        return None
+    except Exception as e:
+        logger.warning("Failed to translate Vega spec to VChart spec: %s", e)
+        return None
     """Optimize Vega-Lite spec for card rendering (e.g. non-zero scale for ratios/margins)."""
     if not isinstance(spec, dict):
         return spec
@@ -226,30 +378,42 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
                 ]
             })
 
-    # 4.5. Render Vega-Lite Chart Image (Option A)
+    # 4.5. Render Chart (Try Feishu Native VChart Component first, fallback to Option A PNG Image)
     vega_cfg = getattr(result, "vega_config", None)
     if vega_cfg:
-        try:
-            import vl_convert as vlc
-            opt_spec = _optimize_vega_spec(vega_cfg)
-            png_bytes = vlc.vegalite_to_png(vl_spec=opt_spec, scale=2)
-            image_key = await upload_image(png_bytes, app_id=app_id)
-            if image_key:
-                elements.append({
-                    "tag": "markdown",
-                    "content": "**📈 可视化数据趋势图：**"
-                })
-                elements.append({
-                    "tag": "img",
-                    "img_key": image_key,
-                    "alt": {
-                        "tag": "plain_text",
-                        "content": "数据可视化趋势图"
-                    },
-                    "mode": "fit_horizontal"
-                })
-        except Exception as e:
-            logger.exception("Failed to render/upload Vega chart image")
+        vchart_spec = vega_to_vchart(vega_cfg)
+        if vchart_spec:
+            logger.info("Successfully translated Vega spec to Feishu VChart spec!")
+            elements.append({
+                "tag": "markdown",
+                "content": "**📈 可视化数据图表 (飞书原生 VChart 渲染)：**"
+            })
+            elements.append({
+                "tag": "chart",
+                "chart_spec": vchart_spec
+            })
+        else:
+            try:
+                import vl_convert as vlc
+                opt_spec = _optimize_vega_spec(vega_cfg)
+                png_bytes = vlc.vegalite_to_png(vl_spec=opt_spec, scale=2)
+                image_key = await upload_image(png_bytes, app_id=app_id)
+                if image_key:
+                    elements.append({
+                        "tag": "markdown",
+                        "content": "**📈 可视化数据趋势图：**"
+                    })
+                    elements.append({
+                        "tag": "img",
+                        "img_key": image_key,
+                        "alt": {
+                            "tag": "plain_text",
+                            "content": "数据可视化趋势图"
+                        },
+                        "mode": "fit_horizontal"
+                    })
+            except Exception as e:
+                logger.exception("Failed to render/upload Vega chart image")
 
     # 5. Cleaned Summary (Business Insight / Analysis) - Moved to the end of informative content
     elements.append({

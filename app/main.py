@@ -190,6 +190,7 @@ async def api_query(request: Request):
             "fields": result.fields,
             "rows": result.rows[:50],
             "chart": bool(result.vega_config),
+            "vega_config": result.vega_config,
             "html_url": None,  # TODO: 恢复 html_url
             "session_id": session_id,
             "conversation_id": result.conversation_name,

@@ -74,6 +74,7 @@ description: BQCA 全领域智能数据查询技能。适用于一线客服、�
   "fields": ["col1", "col2"],
   "rows": [{"col1": "val1", "col2": "val2"}],
   "chart": true,
+  "vega_config": {"mark": "bar", "encoding": {...}, "data": {...}},
   "html_url": null,
   "session_id": "您的当前会话ID_session_id",
   "conversation_id": "projects/...",
