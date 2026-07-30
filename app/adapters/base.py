@@ -28,6 +28,8 @@ class BaseCardAdapter(ABC):
         rows: list[dict] | None = None,
         recommended_questions: list[str] | None = None,
         result_url: str | None = None,
+        vega_config: dict | None = None,
+        app_id: str | None = None,
     ) -> dict:
         """Send rich interactive card with formatted summary, SQL, data table, and follow-ups."""
         pass

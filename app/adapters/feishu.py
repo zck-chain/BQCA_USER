@@ -131,9 +131,8 @@ class FeishuAdapter(BaseCardAdapter):
         if not text:
             return ""
 
-        text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?逻辑解释(?:】|\])?", "【逻辑解释】", text)
-        text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?业务决策洞察(?:】|\])?", "【业务决策洞察】", text)
-        text = re.sub(r"(?:###|##|#)?\s*(?:【|\[)?业务洞察(?:】|\])?", "【业务决策洞察】", text)
+        text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?业务(?:决策)?洞察(?:与建议)?(?:】|\])?", "【业务决策洞察】", text)
+        text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?逻辑解释(?:】|\])?", "【逻辑解释】", text)
 
         intro_part = ""
         logic_part = ""
@@ -200,6 +199,7 @@ class FeishuAdapter(BaseCardAdapter):
         rows: list[dict] | None = None,
         recommended_questions: list[str] | None = None,
         result_url: str | None = None,
+        vega_config: dict | None = None,
         app_id: str | None = None,
     ) -> dict:
         """Send rich Feishu Lark Card v2."""
@@ -209,6 +209,7 @@ class FeishuAdapter(BaseCardAdapter):
                 self.fields = fields or []
                 self.rows = rows or []
                 self.recommended_questions = recommended_questions or []
+                self.vega_config = vega_config
 
         res = MockResult()
         return await feishu_send_premium_result_card(

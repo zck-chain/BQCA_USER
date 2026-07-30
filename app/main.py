@@ -310,6 +310,7 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
             rows=result.rows,
             recommended_questions=result.recommended_questions,
             result_url=result_url,
+            vega_config=result.vega_config,
             app_id=app_id,
         )
 

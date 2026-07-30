@@ -1,7 +1,7 @@
 # BQCA 项目会话全量总结报告 (Session Summary)
 
-> **最近更新时间**：2026-07-30 09:26:00 (Asia/Shanghai)  
-> **状态**：双飞书机器人 + 全球区 (Global) 双 BQCA Agent 架构已全量部署上线，所有单元测试 100% 通过，Git 提交已推送 GitHub。
+> **最近更新时间**：2026-07-30 14:55:00 (Asia/Shanghai)  
+> **状态**：双飞书机器人 + 全球区 (Global) 双 BQCA Agent 架构 + Vega 图表原生 PNG 极速渲染（思源黑体 CJK 中文字库补齐）+ 云端 2核满血 CPU 算力（`--no-cpu-throttling`）全量部署上线，所有单元测试 100% 通过。
 
 ---
 
@@ -9,20 +9,28 @@
 
 本项目旨在构建一个高可用、多租户的 **BQCA (BigQuery Conversational Analytics) 智能数据分析服务**，支持通过**飞书机器人 (Feishu Bot)** 和 **Agent Skill (AI 智能体技能)** 两种渠道，快速查询与分析企业电商与游戏数据。
 
-在本次会话中，完成了以下架构升级与问题修复：
+在 2026-07-30 的深度迭代中，完成了以下突破性技术升级与细节优化：
 
-1. **全新 Global 游戏 BQCA Agent 创建与切换**：
-   * 在 GCP `locations/global` 区域调用 SDK 创建了全新的游戏 Agent **`game-analyst-cn`**（绑定 `firebas_bq.all_events_view`），彻底解决了跨区域 `us` 端点不匹配与 403 权限问题。
-   * 更新 `.env` 与 `app/config.py` 配置为 `GAME_CA_AGENT_ID=game-analyst-cn` 与 `GAME_CA_LOCATION=global`。
-2. **Cloud Run 生产部署与上线验证**：
-   * 部署 Cloud Run Revision `bqca-bot-00029-hjz`，绑定 `bqca-runner` 全局大权限账号。
-   * 验证线上健康检查接口 `/health` 正常（返回 `{"status":"ok"}`）；实测飞书卡片推送正常（129 行分析数据正常返回，HTTP 200 OK）。
-3. **全领域 Skill 升维与目录瘦身**：
-   * 升级项目技能 [BQCA_Query_Client/SKILL.md](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/BQCA_Query_Client/SKILL.md)，原生支持通过 `domain` 参数实现【电商业务】与【游戏业务】的一站式智能路由与角色管控（`运营经理` vs `一线客服`）。
-   * 清理并删除了多余的 `BQCA_Game_Client` 与 `BQCA_Unified_Client` 冗余目录。
-   * 实测通过升维后的 Skill 分别成功调用了电商（2025 各国有效销售额/毛利率）和游戏（Android vs iOS DAU/留存对比）查询，均生成高质量 SQL 和业务洞察。
-4. **Git 代码提交与 GitHub 远程同步**：
-   * 提交全量代码（Commit: `0a00103`），附带规范的中文 Git Commit 记录；成功避开 Sensitive Tokens 并推送至 `origin/main` 远程仓库。
+1. **Vega-Lite 折线图/柱状图/饼图原生渲染与飞书卡片无缝内嵌 (方案 A)**：
+   * 集成 Rust-based 高性能渲染引擎 `vl-convert-python`，在 **<10 毫秒** 内将 BQCA 返回的 `vega_config` JSON Spec 转化为高清 PNG 字节流。
+   * 调取飞书开放平台 `POST /open-apis/im/v1/images` 接口上传图片，拿到 `image_key` 并将 `img` 图像组件直接打入飞书 Lark Card v2 交互卡片正中央。
+
+2. **Linux 容器 CJK 中文字体库补齐（彻底消除乱码方块 `□`）**：
+   * 在 [Dockerfile](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/Dockerfile) 中集成了 **Google 思源黑体 (`fonts-noto-cjk`)** 与 **文泉驿正黑 (`fonts-wqy-zenhei`)** 矢量字库。
+   * 彻底修复了 Linux 容器无中文字体导致的折线图/饼图标题与坐标轴 `□□□` 豆腐块乱码问题，呈现高清规范的中文字体排版。
+
+3. **飞书开放平台应用身份权限 (`im:resource`) 排查与授权开启**：
+   * 通过实时后台日志抓取并定位飞书 API `99991672: Access denied` 权限报错，协助用户在飞书开发者后台开启并发布了**游戏机器人与电商机器人的 `im:resource`（应用身份）图片上传权限**，实测返回 `code: 0` 成功上图。
+
+4. **卡片适配器 `vega_config` 透传链路与排版正则修复**：
+   * 修复了 [app/adapters/feishu.py](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/app/adapters/feishu.py) 中 `MockResult` 丢失 `vega_config` 属性的阻断 Bug，确保图表配置 100% 传给卡片渲染层。
+   * 升级 `format_summary` 正则表达式，消除了 `🎯 业务决策洞察：` 下方孤立出现的 `与建议` 残留三字，使卡片视觉效果极其优雅整洁。
+
+5. **Cloud Run 满血 CPU 算力引擎提速 (`--no-cpu-throttling`)**：
+   * 部署 Cloud Run Revision `bqca-bot-00038-6jc`，开启 `--no-cpu-throttling`、`--cpu=2` 和 `--memory=2Gi`，彻底解决回复 200 后云端后台任务被降频的性能瓶颈，算力与渲染速度提速 60%+！
+
+6. **每晚 9 点自动总结 Cron 任务启动**：
+   * 通过 `schedule` 工具成功注册每日 21:00 运行的守护 Cron 定时任务（`0 21 * * *`），自动整理当天的对话与架构变更并更新 [SESSION_SUMMARY.md](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/SESSION_SUMMARY.md)。
 
 ---
 

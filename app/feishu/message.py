@@ -30,6 +30,65 @@ async def _get_tenant_token(app_id: str | None = None, app_secret: str | None = 
         return data.get("tenant_access_token", "")
 
 
+async def upload_image(image_bytes: bytes, app_id: str | None = None) -> str | None:
+    """Upload image bytes to Feishu Open Platform and return image_key."""
+    token = await _get_tenant_token(app_id=app_id)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        files = {
+            "image_type": (None, "message"),
+            "image": ("chart.png", image_bytes, "image/png"),
+        }
+        resp = await client.post(
+            "https://open.feishu.cn/open-apis/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            files=files,
+        )
+        resp_json = resp.json()
+        if resp.status_code == 200 and resp_json.get("code") == 0:
+            image_key = resp_json.get("data", {}).get("image_key")
+            logger.info("Successfully uploaded image to Feishu: image_key=%s", image_key)
+            return image_key
+        else:
+            logger.error("Failed to upload image to Feishu: status=%d, resp=%s", resp.status_code, resp_json)
+            return None
+
+
+def _optimize_vega_spec(spec: dict) -> dict:
+    """Optimize Vega-Lite spec for card rendering (e.g. non-zero scale for ratios/margins)."""
+    if not isinstance(spec, dict):
+        return spec
+    import copy
+    spec = copy.deepcopy(spec)
+
+    if "config" not in spec:
+        spec["config"] = {}
+    if isinstance(spec["config"], dict):
+        spec["config"]["background"] = "#ffffff"
+
+    specs_to_process = []
+    if "hconcat" in spec and isinstance(spec["hconcat"], list):
+        specs_to_process.extend(spec["hconcat"])
+    elif "vconcat" in spec and isinstance(spec["vconcat"], list):
+        specs_to_process.extend(spec["vconcat"])
+    elif "layer" in spec and isinstance(spec["layer"], list):
+        specs_to_process.extend(spec["layer"])
+    else:
+        specs_to_process.append(spec)
+
+    for sub in specs_to_process:
+        if isinstance(sub, dict) and "encoding" in sub and isinstance(sub["encoding"], dict):
+            enc = sub["encoding"]
+            if "y" in enc and isinstance(enc["y"], dict):
+                y_enc = enc["y"]
+                field_name = str(y_enc.get("field", ""))
+                axis_fmt = str(y_enc.get("axis", {}).get("format", "")) if isinstance(y_enc.get("axis"), dict) else ""
+                if "率" in field_name or "占比" in field_name or "%" in axis_fmt or "ratio" in field_name.lower():
+                    if "scale" not in y_enc:
+                        y_enc["scale"] = {"zero": False}
+
+    return spec
+
+
 async def send_text_message(chat_id: str, text: str, app_id: str | None = None) -> dict:
   """Send plain text message."""
   token = await _get_tenant_token(app_id=app_id)
@@ -166,6 +225,31 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
                   }
                 ]
             })
+
+    # 4.5. Render Vega-Lite Chart Image (Option A)
+    vega_cfg = getattr(result, "vega_config", None)
+    if vega_cfg:
+        try:
+            import vl_convert as vlc
+            opt_spec = _optimize_vega_spec(vega_cfg)
+            png_bytes = vlc.vegalite_to_png(vl_spec=opt_spec, scale=2)
+            image_key = await upload_image(png_bytes, app_id=app_id)
+            if image_key:
+                elements.append({
+                    "tag": "markdown",
+                    "content": "**📈 可视化数据趋势图：**"
+                })
+                elements.append({
+                    "tag": "img",
+                    "img_key": image_key,
+                    "alt": {
+                        "tag": "plain_text",
+                        "content": "数据可视化趋势图"
+                    },
+                    "mode": "fit_horizontal"
+                })
+        except Exception as e:
+            logger.exception("Failed to render/upload Vega chart image")
 
     # 5. Cleaned Summary (Business Insight / Analysis) - Moved to the end of informative content
     elements.append({
