@@ -14,7 +14,7 @@ from app.bqca.client import chat, extract_html_from_summary
 from app.storage.gcs import upload_html, generate_query_id
 from app.adapters import get_card_adapter
 from app.adapters.feishu import extract_thoughts_and_summary
-from app.feishu.event import extract_question, get_message_id, get_chat_id, get_sender_id, parse_card_action, extract_app_id
+from app.feishu.event import extract_question, get_message_id, get_chat_id, get_sender_id, parse_card_action, extract_app_id, is_bot_mentioned
 from app.feishu.message import send_text_message, send_result_card, send_premium_result_card
 from app.storage.sqlite import (
     init_db,
@@ -225,6 +225,12 @@ async def webhook_event(request: Request):
     add_processed_message(msg_id)
 
     logger.info("Feishu event: %s", json.dumps(event, ensure_ascii=False)[:500])
+
+    # Ignore group messages where the bot is not explicitly mentioned (e.g. @_all)
+    if not is_bot_mentioned(event):
+        logger.info("Skipping event: bot not mentioned or @_all only")
+        return {"status": "ok"}
+
     question = extract_question(event)
     if not question:
         return {"status": "ok"}

@@ -29,3 +29,31 @@ def test_verify_token_with_settings():
   from app.config import Settings
   s = Settings(FEISHU_VERIFICATION_TOKEN="my_token")
   assert s.FEISHU_VERIFICATION_TOKEN == "my_token"
+
+
+def test_is_bot_mentioned_p2p():
+    from app.feishu.event import is_bot_mentioned
+    event = {"message": {"chat_type": "p2p"}}
+    assert is_bot_mentioned(event) is True
+
+
+def test_is_bot_mentioned_group_at_all():
+    from app.feishu.event import is_bot_mentioned
+    event = {
+        "message": {
+            "chat_type": "group",
+            "mentions": [{"key": "@_all", "id": {"open_id": "all"}, "name": "所有人"}]
+        }
+    }
+    assert is_bot_mentioned(event) is False
+
+
+def test_is_bot_mentioned_group_bot():
+    from app.feishu.event import is_bot_mentioned
+    event = {
+        "message": {
+            "chat_type": "group",
+            "mentions": [{"key": "@_user_1", "id": {"open_id": "ou_bot123"}, "name": "电商数据Agent"}]
+        }
+    }
+    assert is_bot_mentioned(event) is True

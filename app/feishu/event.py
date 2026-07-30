@@ -61,8 +61,40 @@ def get_chat_id(event: dict) -> str:
 
 
 def get_sender_id(event: dict) -> str:
-  """Get sender open_id for session/permission mapping."""
-  return event.get("sender", {}).get("sender_id", {}).get("open_id", "")
+    """Get sender open_id for session/permission mapping."""
+    return event.get("sender", {}).get("sender_id", {}).get("open_id", "")
+
+
+def is_bot_mentioned(event: dict) -> bool:
+    """Check if the bot is explicitly mentioned in a group chat.
+
+    Returns False if there are no mentions or if the mentions only consist of @_all (mention all).
+    """
+    message = event.get("message", {})
+    chat_type = message.get("chat_type", "")
+
+    # In 1-on-1 (p2p) chat, all messages are directed to the bot
+    if chat_type == "p2p":
+        return True
+
+    mentions = message.get("mentions", [])
+    if not mentions:
+        return False
+
+    # Check if there is any mention that is NOT @_all
+    for mention in mentions:
+        key = mention.get("key", "")
+        open_id = mention.get("id", {}).get("open_id", "")
+        name = mention.get("name", "")
+
+        # Ignore @_all / @所有人 / open_id == "all"
+        if key == "@_all" or open_id == "all" or name in ("所有人", "All", "all"):
+            continue
+
+        # Found a specific bot/user mention
+        return True
+
+    return False
 
 
 def parse_card_action(body: dict, get_chat_type_fn, get_conversation_fn) -> tuple[str | None, str | None]:
