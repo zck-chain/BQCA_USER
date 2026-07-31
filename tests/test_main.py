@@ -1,26 +1,18 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from fastapi.testclient import TestClient
-from app.main import app
+from app.main import BQCAAgentConfig, _process_query, app
+from app.storage import sqlite as sqlite_storage
 
 client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def clear_feishu_demo_sessions():
-  from app import main
-
-  sessions = getattr(main, "_feishu_role_sessions", None)
-  if sessions is not None:
-      sessions.clear()
-  conversations = getattr(main, "_feishu_conversations", None)
-  if conversations is not None:
-      conversations.clear()
+def isolated_sqlite_db(tmp_path, monkeypatch):
+  db_path = tmp_path / "bqca_sessions.db"
+  monkeypatch.setattr(sqlite_storage, "DB_PATH", str(db_path))
+  sqlite_storage.init_db()
   yield
-  if sessions is not None:
-      sessions.clear()
-  if conversations is not None:
-      conversations.clear()
 
 
 def test_health():
@@ -59,11 +51,20 @@ def test_handle_message_event():
   assert resp.status_code == 200
 
 
-def test_feishu_query_requires_role_for_new_session():
-  resp = client.post("/api/query", json={"question": "商品状态分布"})
+def test_feishu_query_defaults_role_for_new_session():
+  result = MagicMock(
+      summary="默认结果",
+      sql="SELECT 1",
+      fields=["status"],
+      rows=[{"status": "OK"}],
+      vega_config=None,
+      conversation_name="conversations/default-1",
+  )
+  with patch("app.main.chat", return_value=result) as mock_chat:
+      resp = client.post("/api/query", json={"question": "商品状态分布"})
 
-  assert resp.status_code == 400
-  assert resp.json()["detail"] == "role is required for a new session"
+  assert resp.status_code == 200
+  assert resp.json()["role"] == "运营经理"
 
 
 def test_feishu_query_sets_role_without_calling_bqca():
@@ -158,3 +159,129 @@ def test_game_agent_routing():
     assert mock_chat.call_args_list[0].kwargs["agent_id"] == "game-analyst-cn"
     assert mock_chat.call_args_list[0].kwargs["location"] == "global"
 
+
+def test_game_api_query_uses_support_service_account_for_support_role():
+    game_result = MagicMock(
+        summary="游戏客服结果",
+        sql="SELECT 1",
+        fields=["玩家数"],
+        rows=[{"玩家数": 1000}],
+        vega_config=None,
+        conversation_name="conversations/game-support-1",
+    )
+
+    with patch("app.main.settings.BQCA_SUPPORT_SERVICE_ACCOUNT", "support-test-sa"), \
+         patch("app.main.chat", return_value=game_result) as mock_chat:
+        resp = client.post("/api/query", json={
+            "question": "游戏玩家活跃度",
+            "role": "客服",
+            "domain": "game",
+        })
+
+    assert resp.status_code == 200
+    assert mock_chat.call_args_list[0].kwargs["target_service_account"] == "support-test-sa"
+
+
+def test_switching_from_default_ecommerce_to_game_clears_conversation():
+    ecommerce_result = MagicMock(
+        summary="电商结果",
+        sql="SELECT 1",
+        fields=["商品数"],
+        rows=[{"商品数": 10}],
+        vega_config=None,
+        conversation_name="conversations/ecommerce-1",
+    )
+    game_result = MagicMock(
+        summary="游戏结果",
+        sql="SELECT 2",
+        fields=["玩家数"],
+        rows=[{"玩家数": 20}],
+        vega_config=None,
+        conversation_name="conversations/game-1",
+    )
+
+    with patch("app.main.chat", side_effect=[ecommerce_result, game_result]) as mock_chat:
+        first_resp = client.post("/api/query", json={"question": "商品状态分布"})
+        second_resp = client.post("/api/query", json={
+            "question": "玩家活跃度",
+            "domain": "game",
+            "session_id": first_resp.json()["session_id"],
+        })
+
+    assert second_resp.status_code == 200
+    assert mock_chat.call_args_list[1].args == ("玩家活跃度", None)
+
+
+@pytest.mark.asyncio
+async def test_game_query_uses_game_fallback_questions():
+    result = MagicMock(
+        summary="游戏结果",
+        sql="",
+        fields=[],
+        rows=[],
+        vega_config=None,
+        conversation_name="conversations/game-1",
+        recommended_questions=[],
+        thinking_process=[],
+    )
+    adapter = MagicMock()
+    adapter.send_text_message = AsyncMock()
+    adapter.send_result_card = AsyncMock()
+    adapter.format_summary.return_value = ""
+
+    with patch("app.main.get_card_adapter", return_value=adapter), \
+         patch("app.main.get_agent_config", return_value=BQCAAgentConfig(
+             agent_id="game-analyst-cn",
+             location="global",
+             display_name="Flood-It! 游戏数据洞察专家",
+             domain="game",
+         )), \
+         patch("app.main.chat", return_value=result), \
+         patch("app.main._get_conversation", return_value=None), \
+         patch("app.main._save_conversation"):
+        await _process_query("分析玩家数据", "ou_test", app_id="game-app")
+
+    fallback_questions = adapter.send_result_card.await_args.kwargs["recommended_questions"]
+    assert fallback_questions == [
+        "分析近期 DAU 与玩家活跃趋势",
+        "查看玩家留存率变化",
+        "查询失败次数最高的关卡",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_webhook_conversation_is_scoped_by_domain():
+    ecommerce_result = MagicMock(
+        summary="电商结果",
+        sql="",
+        fields=[],
+        rows=[],
+        vega_config=None,
+        conversation_name="conversations/ecommerce-1",
+        recommended_questions=[],
+        thinking_process=[],
+    )
+    game_result = MagicMock(
+        summary="游戏结果",
+        sql="",
+        fields=[],
+        rows=[],
+        vega_config=None,
+        conversation_name="conversations/game-1",
+        recommended_questions=[],
+        thinking_process=[],
+    )
+    adapter = MagicMock()
+    adapter.send_text_message = AsyncMock()
+    adapter.send_result_card = AsyncMock()
+    adapter.format_summary.return_value = ""
+
+    with patch("app.main.get_card_adapter", return_value=adapter), \
+         patch("app.main.settings.GAME_FEISHU_APP_ID", "game-app"), \
+         patch("app.main.chat", side_effect=[ecommerce_result, game_result]) as mock_chat, \
+         patch("app.main.upload_html", new_callable=AsyncMock):
+        await _process_query("商品状态分布", "oc_same_chat")
+        await _process_query("玩家活跃度", "oc_same_chat", app_id="game-app")
+
+    assert mock_chat.call_args_list[0].args == ("商品状态分布", None)
+    assert mock_chat.call_args_list[1].args == ("玩家活跃度", None)

@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
-from app.feishu.message import send_text_message, send_result_card
+from app.feishu.message import send_text_message, send_result_card, vega_to_vchart
 
 
 @pytest.mark.asyncio
@@ -40,3 +40,27 @@ async def test_send_result_card_contains_link():
         body = call_args[1]["json"]
         assert "https://example.com/result.html" in str(body)
 
+
+def test_composite_vega_spec_uses_png_fallback():
+    spec = {
+        "hconcat": [
+            {
+                "mark": "bar",
+                "data": {"values": [{"category": "A", "count": 10}]},
+                "encoding": {
+                    "x": {"field": "category"},
+                    "y": {"field": "count"},
+                },
+            },
+            {
+                "mark": "line",
+                "data": {"values": [{"date": "2026-01-01", "rate": 0.5}]},
+                "encoding": {
+                    "x": {"field": "date"},
+                    "y": {"field": "rate"},
+                },
+            },
+        ],
+    }
+
+    assert vega_to_vchart(spec) is None

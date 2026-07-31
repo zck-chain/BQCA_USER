@@ -54,6 +54,10 @@ def _save_conversation(session_key: str, conversation_name: str) -> None:
     save_chat_conversation(session_key, conversation_name)
 
 
+def _scoped_conversation_key(session_key: str, domain: str) -> str:
+    return f"{domain}:{session_key}"
+
+
 def _resolve_demo_role(role: str | None) -> str | None:
     if not role:
         return None
@@ -62,7 +66,7 @@ def _resolve_demo_role(role: str | None) -> str | None:
 
 
 def _get_feishu_role(session_id: str) -> str | None:
-    role, _ = get_role_session(session_id, SESSION_TTL)
+    role, _, _ = get_role_session(session_id, SESSION_TTL)
     return role
 
 
@@ -70,16 +74,17 @@ def _save_feishu_role(session_id: str, role: str) -> None:
     save_role_session(session_id, role)
 
 
-def _get_feishu_conversation(session_id: str) -> str | None:
-    _, conversation_name = get_role_session(session_id, SESSION_TTL)
-    return conversation_name
+def _get_feishu_conversation(session_id: str) -> tuple[str | None, str | None]:
+    """Returns (conversation_name, last_domain)."""
+    _, conversation_name, last_domain = get_role_session(session_id, SESSION_TTL)
+    return conversation_name, last_domain
 
 
-def _save_feishu_conversation(session_id: str, conversation_name: str) -> None:
+def _save_feishu_conversation(session_id: str, conversation_name: str, last_domain: str | None = None) -> None:
     # Fetch existing role to preserve it while updating conversation_name
     role = _get_feishu_role(session_id)
     if role:
-        save_role_session(session_id, role, conversation_name)
+        save_role_session(session_id, role, conversation_name, last_domain)
 
 
 def _service_account_for_role(role: str) -> str | None:
@@ -93,6 +98,7 @@ class BQCAAgentConfig:
     agent_id: str
     location: str
     display_name: str
+    domain: str
 
 
 def get_agent_config(domain: str | None = None, app_id: str | None = None) -> BQCAAgentConfig:
@@ -102,11 +108,13 @@ def get_agent_config(domain: str | None = None, app_id: str | None = None) -> BQ
             agent_id=settings.GAME_CA_AGENT_ID or "game-analyst-cn",
             location=settings.GAME_CA_LOCATION or "global",
             display_name="Flood-It! 游戏数据洞察专家",
+            domain="game",
         )
     return BQCAAgentConfig(
         agent_id=settings.CA_AGENT_ID,
         location=settings.CA_LOCATION,
         display_name="电商数据 Agent",
+        domain="ecommerce",
     )
 
 
@@ -139,7 +147,7 @@ async def health():
 async def api_query(request: Request):
     """
     Role-based query API for the Demo skill.
-    Body: {"question", "role", "session_id", "conversation_id"}
+    Body: {"question", "role", "session_id", "conversation_id", "domain"}
     """
     body = await request.json()
     question = body.get("question", "").strip()
@@ -152,14 +160,23 @@ async def api_query(request: Request):
     saved_role = _get_feishu_role(session_id)
     role = requested_role or saved_role
     if role is None:
-        raise HTTPException(status_code=400, detail="role is required for a new session")
+        # Compliance with SKILL.md: default to '运营经理' for first queries when no role is given
+        role = "运营经理"
 
     # If the role is switched, clear the current conversation to avoid cross-talk
     if requested_role is not None and requested_role != saved_role:
         clear_role_conversation(session_id)
 
     _save_feishu_role(session_id, role)
-    conversation_name = _get_feishu_conversation(session_id)
+    conversation_name, last_domain = _get_feishu_conversation(session_id)
+
+    requested_domain = (body.get("domain") or body.get("app") or "").lower()
+    domain = "game" if requested_domain == "game" else "ecommerce"
+    if last_domain and last_domain != domain:
+        # Cross-talk Prevention: if the queried domain changes (e.g. game -> ecommerce), clear conversation context
+        clear_role_conversation(session_id)
+        conversation_name = None
+
     if not question:
         if requested_role is not None:
             return {
@@ -170,19 +187,19 @@ async def api_query(request: Request):
             }
         raise HTTPException(status_code=400, detail="question is required")
 
-    domain = (body.get("domain") or body.get("app") or "").lower()
     agent_cfg = get_agent_config(domain)
+    target_service_account = _service_account_for_role(role)
 
     try:
         result = await asyncio.to_thread(
             chat,
             question,
             conversation_name,
-            target_service_account=_service_account_for_role(role),
+            target_service_account=target_service_account,
             agent_id=agent_cfg.agent_id,
             location=agent_cfg.location,
         )
-        _save_feishu_conversation(session_id, result.conversation_name)
+        _save_feishu_conversation(session_id, result.conversation_name, last_domain=domain)
 
         return {
             "summary": result.summary,
@@ -258,8 +275,8 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
     try:
         await adapter.send_text_message(chat_id, "正在查询，请稍候...", app_id=app_id)
 
-        # Reuse conversation for the same chat room
-        conversation_name = _get_conversation(chat_id)
+        session_key = _scoped_conversation_key(chat_id, agent_cfg.domain)
+        conversation_name = _get_conversation(session_key)
         result = await asyncio.to_thread(
             chat,
             question,
@@ -269,7 +286,7 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
         )
 
         # Save conversation for follow-up questions
-        _save_conversation(chat_id, result.conversation_name)
+        _save_conversation(session_key, result.conversation_name)
 
         logger.info("BQCA result: %d rows, sql=%s, chart=%s, convo=%s",
                      len(result.rows), bool(result.sql), bool(result.vega_config),
@@ -282,11 +299,18 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
 
         # Fallback recommended questions if BQCA returned empty
         if not result.recommended_questions:
-            result.recommended_questions = [
-                "各订单状态的占比情况",
-                "分析近一年销售额 Top 5 的国家",
-                "查询退货数最高的前 5 类商品"
-            ]
+            if agent_cfg.domain == "game":
+                result.recommended_questions = [
+                    "分析近期 DAU 与玩家活跃趋势",
+                    "查看玩家留存率变化",
+                    "查询失败次数最高的关卡",
+                ]
+            else:
+                result.recommended_questions = [
+                    "各订单状态的占比情况",
+                    "分析近一年销售额 Top 5 的国家",
+                    "查询退货数最高的前 5 类商品",
+                ]
 
         # Extract native BQCA HTML code block if present and upload to GCS
         html_code, clean_summary = extract_html_from_summary(summary)

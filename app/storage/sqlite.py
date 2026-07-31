@@ -14,7 +14,7 @@ def init_db() -> None:
     logger.info("Initialising SQLite database at: %s", DB_PATH)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")  # Enable WAL mode for better concurrency
-        
+
         # 1. Processed messages table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_messages (
@@ -22,7 +22,7 @@ def init_db() -> None:
                 processed_at REAL NOT NULL
             )
         """)
-        
+
         # 2. Chat sessions table (Feishu webhook conversations)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_sessions (
@@ -31,17 +31,22 @@ def init_db() -> None:
                 last_active REAL NOT NULL
             )
         """)
-        
+
         # 3. Role sessions table (API query demo sessions)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS role_sessions (
                 session_id TEXT PRIMARY KEY,
                 selected_role TEXT NOT NULL,
                 conversation_name TEXT,
+                last_domain TEXT,
                 last_active REAL NOT NULL
             )
         """)
-        
+
+        role_session_columns = {row[1] for row in conn.execute("PRAGMA table_info(role_sessions)")}
+        if "last_domain" not in role_session_columns:
+            conn.execute("ALTER TABLE role_sessions ADD COLUMN last_domain TEXT;")
+
         # 4. Chat room types registry table (Group vs P2P)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_room_types (
@@ -89,14 +94,14 @@ def get_chat_conversation(session_key: str, ttl: float) -> str | None:
         row = cursor.fetchone()
         if row is None:
             return None
-        
+
         convo_name, last_active = row
         if time.time() - last_active > ttl:
             # Session expired, delete it
             cursor.execute("DELETE FROM chat_sessions WHERE session_key = ?", (session_key,))
             conn.commit()
             return None
-        
+
         # Refresh last active timestamp
         cursor.execute(
             "UPDATE chat_sessions SET last_active = ? WHERE session_key = ?",
@@ -118,57 +123,57 @@ def save_chat_conversation(session_key: str, conversation_name: str) -> None:
 # 3. Role sessions (Web API query Demo) helper functions
 # ---------------------------------------------------------------------------
 
-def get_role_session(session_id: str, ttl: float) -> tuple[str | None, str | None]:
+def get_role_session(session_id: str, ttl: float) -> tuple[str | None, str | None, str | None]:
     """
-    Retrieve selected role and BQCA conversation name for a session ID.
-    Returns (role, conversation_name) or (None, None) if expired/not found.
+    Retrieve selected role, BQCA conversation name, and last_domain for a session ID.
+    Returns (role, conversation_name, last_domain) or (None, None, None) if expired/not found.
     """
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT selected_role, conversation_name, last_active FROM role_sessions WHERE session_id = ?",
+            "SELECT selected_role, conversation_name, last_domain, last_active FROM role_sessions WHERE session_id = ?",
             (session_id,)
         )
         row = cursor.fetchone()
         if row is None:
-            return None, None
-        
-        role, convo_name, last_active = row
+            return None, None, None
+
+        role, convo_name, last_domain, last_active = row
         if time.time() - last_active > ttl:
             # Session expired, delete it
             cursor.execute("DELETE FROM role_sessions WHERE session_id = ?", (session_id,))
             conn.commit()
-            return None, None
-        
+            return None, None, None
+
         # Refresh last active timestamp
         cursor.execute(
             "UPDATE role_sessions SET last_active = ? WHERE session_id = ?",
             (time.time(), session_id)
         )
         conn.commit()
-        return role, convo_name
+        return role, convo_name, last_domain
 
-def save_role_session(session_id: str, role: str, conversation_name: str | None = None) -> None:
-    """Save or update role and optional conversation name for a session ID."""
+def save_role_session(session_id: str, role: str, conversation_name: str | None = None, last_domain: str | None = None) -> None:
+    """Save or update role, optional conversation name, and optional last_domain for a session ID."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        if conversation_name is None:
-            # Do an upsert: preserve existing conversation_name if we are only changing/saving the role
-            cursor.execute(
-                "SELECT conversation_name FROM role_sessions WHERE session_id = ?",
-                (session_id,)
-            )
-            existing = cursor.fetchone()
-            convo_to_save = existing[0] if existing else None
-        else:
-            convo_to_save = conversation_name
+
+        # Do an upsert: preserve existing values if they are not provided
+        cursor.execute(
+            "SELECT conversation_name, last_domain FROM role_sessions WHERE session_id = ?",
+            (session_id,)
+        )
+        existing = cursor.fetchone()
+
+        convo_to_save = conversation_name if conversation_name is not None else (existing[0] if existing else None)
+        domain_to_save = last_domain if last_domain is not None else (existing[1] if existing else None)
 
         cursor.execute(
             """
-            INSERT OR REPLACE INTO role_sessions (session_id, selected_role, conversation_name, last_active)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO role_sessions (session_id, selected_role, conversation_name, last_domain, last_active)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (session_id, role, convo_to_save, time.time())
+            (session_id, role, convo_to_save, domain_to_save, time.time())
         )
         conn.commit()
 
@@ -195,15 +200,15 @@ def cleanup_expired_sessions(ttl: float) -> None:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM chat_sessions WHERE ? - last_active > ?", (now, ttl))
             chat_deleted = cursor.rowcount
-            
+
             # Delete expired role sessions
             cursor.execute("DELETE FROM role_sessions WHERE ? - last_active > ?", (now, ttl))
             role_deleted = cursor.rowcount
-            
+
             # Delete very old processed messages (older than 24 hours) to keep DB compact
             cursor.execute("DELETE FROM processed_messages WHERE ? - processed_at > 86400", (now,))
             msg_deleted = cursor.rowcount
-            
+
             conn.commit()
             logger.info(
                 "Cleanup finished. Deleted %d chat sessions, %d role sessions, %d old processed messages.",

@@ -60,6 +60,8 @@ def vega_to_vchart(spec: dict) -> dict | None:
     """
     if not isinstance(spec, dict):
         return None
+    if any(key in spec for key in ("hconcat", "vconcat", "layer")):
+        return None
 
     try:
         raw_title = spec.get("title")
@@ -72,12 +74,6 @@ def vega_to_vchart(spec: dict) -> dict | None:
         title_cfg = {"text": title_text, "visible": bool(title_text)}
 
         values = spec.get("data", {}).get("values", [])
-        if not values and "hconcat" in spec and isinstance(spec["hconcat"], list):
-            for sub in spec["hconcat"]:
-                if isinstance(sub, dict) and sub.get("data", {}).get("values"):
-                    values = sub["data"]["values"]
-                    break
-
         if not values:
             return None
 
@@ -178,34 +174,13 @@ def vega_to_vchart(spec: dict) -> dict | None:
                 }
             }
 
-        # 4. Handle hconcat (Horizontal concat)
-        elif "hconcat" in spec and isinstance(spec["hconcat"], list) and len(spec["hconcat"]) >= 2:
-            sub1 = spec["hconcat"][0]
-            sub2 = spec["hconcat"][1]
-            enc1 = sub1.get("encoding", {}) if isinstance(sub1, dict) else {}
-            enc2 = sub2.get("encoding", {}) if isinstance(sub2, dict) else {}
-            x1, y1 = enc1.get("x", {}).get("field"), enc1.get("y", {}).get("field")
-            x2, y2 = enc2.get("x", {}).get("field"), enc2.get("y", {}).get("field")
-            if x1 and y1 and x2 and y2:
-                return {
-                    "type": "common",
-                    "title": title_cfg,
-                    "data": data_spec,
-                    "layout": {"type": "grid", "col": 2, "row": 1},
-                    "region": [
-                        {"id": "region1", "gridRow": 0, "gridCol": 0},
-                        {"id": "region2", "gridRow": 0, "gridCol": 1},
-                    ],
-                    "series": [
-                        {"type": "bar", "regionId": "region1", "xField": x1, "yField": y1},
-                        {"type": "bar", "regionId": "region2", "xField": x2, "yField": y2},
-                    ],
-                }
-
         return None
     except Exception as e:
         logger.warning("Failed to translate Vega spec to VChart spec: %s", e)
         return None
+
+
+def _optimize_vega_spec(spec: dict) -> dict:
     """Optimize Vega-Lite spec for card rendering (e.g. non-zero scale for ratios/margins)."""
     if not isinstance(spec, dict):
         return spec
