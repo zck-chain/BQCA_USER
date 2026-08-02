@@ -137,3 +137,56 @@ def test_format_summary_inline_merged_bullets():
     res = adapter.format_summary(raw_text)
     assert "1. 洞察要点一：🔍 现象：" in res
     assert "💡 建议：" in res
+
+
+def test_format_summary_drops_analysis_preamble_before_structured_insights():
+    from app.adapters.feishu import FeishuAdapter
+    adapter = FeishuAdapter()
+    raw_text = """
+    BUSINESS_INSIGHTS:
+    第四季度服饰商品退货率异常组合分析
+
+    为了深度拆解服饰商品退货表现，我们选取了 2025 年第四季度这一完整季度。
+    为识别出具有统计学意义和优化价值的异常组合，我们设定了以下过滤规则：
+    1. 样本量足够：售出件数不得低于 10 件。
+    2. 退货率显著偏高：高出季度整体水平 10 个百分点以上。
+    通过四维交叉透视，共筛选出 16 个严重超出平均水平的异常组合。
+
+    1. 特定履约仓与贴身衣物类目存在潜在质量或运营隐患
+    - 现象：Comfort Choice 品牌的退货率高达 36.36%。
+    - 建议：立即审计仓储、包装流程及发货时效。
+    2. 高敏感品类在中低价格带极易因期望不符退货
+    - 现象：Mommy Paradise 品牌的退货率高达 36.36%。
+    - 建议：改善商品详情页的尺码与面料说明。
+    """
+
+    res = adapter.format_summary(raw_text)
+
+    assert "1. 特定履约仓" in res
+    assert "2. 高敏感品类" in res
+    assert "第四季度服饰商品退货率异常组合分析" not in res
+    assert "为了深度拆解" not in res
+    assert "样本量足够" not in res
+    assert "通过四维交叉透视" not in res
+
+
+def test_format_summary_uses_explicit_business_insight_boundaries():
+    from app.adapters.feishu import FeishuAdapter
+    adapter = FeishuAdapter()
+    raw_text = """
+    LOGIC_EXPLANATION: 使用第四季度完整数据，并过滤低样本组合。
+    BUSINESS_INSIGHTS_BEGIN
+    1. 退货异常集中
+    - 现象：三个组合的退货率超过 30%。
+    - 建议：优先复核对应仓库和商品页面。
+    BUSINESS_INSIGHTS_END
+    推荐追问：是否需要继续查看详细订单？
+    """
+
+    res = adapter.format_summary(raw_text)
+
+    assert "1. 退货异常集中" in res
+    assert "使用第四季度完整数据" not in res
+    assert "BUSINESS_INSIGHTS_BEGIN" not in res
+    assert "BUSINESS_INSIGHTS_END" not in res
+    assert "推荐追问" not in res

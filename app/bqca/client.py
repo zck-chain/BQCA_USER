@@ -141,7 +141,8 @@ def chat(question: str, conversation_name: str | None = None,
 
     result = ChatResult()
     result.conversation_name = conversation_name
-    text_parts: list[str] = []
+    final_text_messages: list[str] = []
+    legacy_text_messages: list[str] = []
 
     for message in chat_client.chat(request=req):
         sm_dict = MessageToDict(message.system_message._pb)
@@ -161,14 +162,17 @@ def chat(question: str, conversation_name: str | None = None,
                     cleaned_thought = part.strip()
                     if cleaned_thought and cleaned_thought not in result.thinking_process:
                         result.thinking_process.append(cleaned_thought)
-            else:
-                for part in parts:
-                    if _is_noise(part):
-                        cleaned_thought = part.strip()
-                        if cleaned_thought and cleaned_thought not in result.thinking_process:
-                            result.thinking_process.append(cleaned_thought)
-                    else:
-                        text_parts.append(part)
+            elif text_type == "PROGRESS":
+                continue
+            elif text_type == "FINAL_RESPONSE":
+                final_text = "".join(parts).strip()
+                if final_text:
+                    final_text_messages.append(final_text)
+            elif text_type in ("", "TEXT_TYPE_UNSPECIFIED"):
+                visible_parts = [part for part in parts if not _is_noise(part)]
+                final_text = "".join(visible_parts).strip()
+                if final_text:
+                    legacy_text_messages.append(final_text)
 
         if "data" in sm_dict:
             data = sm_dict["data"]
@@ -191,8 +195,10 @@ def chat(question: str, conversation_name: str | None = None,
                 if q and q not in result.recommended_questions:
                     result.recommended_questions.append(q)
 
-    if text_parts:
-        result.summary = " ".join(text_parts)
+    if final_text_messages:
+        result.summary = "\n".join(final_text_messages)
+    elif legacy_text_messages:
+        result.summary = "\n".join(legacy_text_messages)
 
     logger.info("BQCA chat done: %d rows, sql=%s, chart=%s, sa=%s",
                  len(result.rows), bool(result.sql), bool(result.vega_config),
@@ -214,4 +220,3 @@ def extract_html_from_summary(summary: str) -> tuple[str | None, str]:
         clean_summary = pattern.sub("", summary).strip()
         return html_code, clean_summary
     return None, summary
-

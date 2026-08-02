@@ -11,6 +11,12 @@ from app.feishu.message import (
 
 logger = logging.getLogger(__name__)
 
+_BUSINESS_INSIGHTS_BOUNDARY_RE = re.compile(
+    r"BUSINESS_INSIGHTS_BEGIN\s*(.*?)\s*BUSINESS_INSIGHTS_END",
+    re.IGNORECASE | re.DOTALL,
+)
+_NUMBERED_INSIGHT_RE = re.compile(r"(?m)^[ \t]*\d+\.\s+\S.*$")
+
 
 def get_emoji_for_key(key: str) -> str:
     key_lower = key.lower()
@@ -169,6 +175,19 @@ def clean_technical_lines(text: str) -> str:
     return text
 
 
+def trim_analysis_preamble(text: str) -> str:
+    """Start at the first numbered item that contains both a phenomenon and advice."""
+    matches = list(_NUMBERED_INSIGHT_RE.finditer(text))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        item = text[match.start():end]
+        has_phenomenon = re.search(r"(?:🔍\s*)?现象\s*[：:]", item)
+        has_advice = re.search(r"(?:💡\s*)?建议\s*[：:]", item)
+        if has_phenomenon and has_advice:
+            return text[match.start():].strip()
+    return text.strip()
+
+
 def clean_latex(s: str) -> str:
     """Clean LaTeX symbols in summary for Feishu Lark card rendering."""
     if not s:
@@ -194,6 +213,10 @@ class FeishuAdapter(BaseCardAdapter):
         """Format BQCA summary sections specifically for Feishu Markdown card output."""
         if not text:
             return ""
+
+        bounded_insights = _BUSINESS_INSIGHTS_BOUNDARY_RE.search(text)
+        if bounded_insights:
+            text = f"BUSINESS_INSIGHTS:\n{bounded_insights.group(1).strip()}"
 
         text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?(?:BUSINESS_INSIGHTS|BUSINESS_INSIGHT|业务决策洞察|业务洞察|核心业务洞察与落地建议)(?:】|\])?\s*(：|:)?", "【业务决策洞察】", text, flags=re.IGNORECASE)
         text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?(?:LOGIC_EXPLANATION|逻辑解释|设计分析概要|数据提取逻辑)(?:】|\])?\s*(：|:)?", "【逻辑解释】", text, flags=re.IGNORECASE)
@@ -223,7 +246,7 @@ class FeishuAdapter(BaseCardAdapter):
         else:
             insight_part = text
 
-        cleaned_insight = clean_technical_lines(insight_part).strip()
+        cleaned_insight = trim_analysis_preamble(clean_technical_lines(insight_part))
         cleaned_logic = clean_technical_lines(logic_part).strip()
 
         for placeholder in ["•", "*", "-", ".", ""]:
