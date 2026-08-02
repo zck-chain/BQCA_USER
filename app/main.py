@@ -292,10 +292,13 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
                      len(result.rows), bool(result.sql), bool(result.vega_config),
                      result.conversation_name[-20:] if result.conversation_name else "none")
 
-        # Split BQCA text into English thinking lines and Chinese summary
-        thoughts, summary = extract_thoughts_and_summary(result.summary)
-        if thoughts:
-            result.thinking_process.extend(thoughts)
+        # Split BQCA text into English thinking lines and Chinese summary (Bypassed if using new structured Map-keys)
+        if "LOGIC_EXPLANATION" in result.summary or "BUSINESS_INSIGHTS" in result.summary:
+            summary = result.summary
+        else:
+            thoughts, summary = extract_thoughts_and_summary(result.summary)
+            if thoughts:
+                result.thinking_process.extend(thoughts)
 
         # Fallback recommended questions if BQCA returned empty
         if not result.recommended_questions:

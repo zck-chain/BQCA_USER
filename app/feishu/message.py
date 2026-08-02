@@ -53,13 +53,247 @@ async def upload_image(image_bytes: bytes, app_id: str | None = None) -> str | N
             return None
 
 
-def vega_to_vchart(spec: dict) -> dict | None:
+def translate_spec_fields(obj: dict, sql: str | None = None) -> dict:
+    """Recursively translate English field names in Vega spec to Chinese."""
+    import copy
+    import re
+    obj = copy.deepcopy(obj)
+    
+    # 1. Extract actual data keys and partition them by type (nominal vs quantitative)
+    row_keys = []
+    nominal_keys = []
+    quantitative_keys = []
+    
+    values = obj.get("data", {}).get("values", [])
+    if isinstance(values, list) and len(values) > 0 and isinstance(values[0], dict):
+        first_row = values[0]
+        row_keys = list(first_row.keys())
+        for k, val in first_row.items():
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                quantitative_keys.append(k)
+            else:
+                nominal_keys.append(k)
+
+    # 2. Extract mappings from SQL aliases (e.g. `browser AS 浏览器`)
+    sql_mappings = {}
+    if sql and isinstance(sql, str):
+        # Strip comments
+        cleaned_sql = re.sub(r"--.*", "", sql)
+        cleaned_sql = re.sub(r"/\*.*?\*/", "", cleaned_sql, flags=re.DOTALL)
+        # Find matches for identifier/expression AS alias
+        matches = re.findall(r"([\w_\.]+)\s+AS\s+([\u4e00-\u9fa5\w_]+)", cleaned_sql, re.IGNORECASE)
+        for eng, chn in matches:
+            eng_key = eng.split(".")[-1].lower() # strip table prefix
+            sql_mappings[eng_key] = chn
+
+    # Base translation dictionary for standard business concepts as strong fallback
+    FIELD_TRANSLATIONS = {
+        # Dimensions
+        "brand": "品牌",
+        "category": "品类",
+        "browser": "浏览器",
+        "user_type": "用户类型",
+        "operating_system": "操作系统",
+        "os": "操作系统",
+        "device_category": "设备类型",
+        "device": "设备",
+        "country": "国家",
+        "region": "地区",
+        "city": "城市",
+        "event_date": "日期",
+        "created_at": "日期",
+        "date": "日期",
+        "register_channel": "注册渠道",
+        "channel": "渠道",
+        "status": "订单状态",
+        "product_name": "商品名称",
+        "cohort_month": "注册月份",
+        "event_name": "事件名称",
+        "user_pseudo_id": "用户ID",
+        "level_id": "关卡ID",
+        "level": "关卡",
+        
+        # Metrics
+        "total_items_sold": "售出总件数",
+        "total_sales_amount": "总销售额",
+        "sales_amount": "销售额",
+        "available_inventory": "可售库存",
+        "avg_age": "平均库龄",
+        "sale_price": "销售价格",
+        "total_orders": "订单总数",
+        "orders_count": "订单数",
+        "order_count": "订单数",
+        "user_count": "用户数",
+        "active_users": "活跃用户数",
+        "dau": "DAU",
+        "mau": "MAU",
+        "retention_rate": "留存率",
+        "first_purchase_users": "首购用户数",
+        "avg_order_amount": "首单平均商品金额",
+        "avg_amount": "平均金额",
+        "conversion_rate": "转化率",
+        
+        # Funnel steps
+        "homepage_visits": "首页访问数",
+        "category_visits": "分类页访问数",
+        "product_visits": "商品页访问数",
+        "cart_visits": "购物车访问数",
+        "purchase_visits": "购买数",
+        "homepage": "首页访问数",
+        "category_page": "分类页访问数",
+        "product_page": "商品页访问数",
+        "cart": "购物车访问数",
+        "purchase": "购买事件数",
+        "buy": "购买数"
+    }
+
+    # Gather all fields in the Vega-Lite encoding that need mapping
+    encoding_fields = []
+    
+    def _collect_fields(item):
+        if isinstance(item, dict):
+            for k, v in item.items():
+                if k == "field" and isinstance(v, str):
+                    encoding_fields.append(v)
+                else:
+                    _collect_fields(v)
+        elif isinstance(item, list):
+            for x in item:
+                _collect_fields(x)
+
+    _collect_fields(obj.get("encoding", {}))
+    # De-duplicate while preserving order
+    unique_enc_fields = []
+    for f in encoding_fields:
+        if f not in unique_enc_fields:
+            unique_enc_fields.append(f)
+
+    # Pre-calculate mappings for all unique encoding fields in the spec
+    final_mappings = {}
+    mapped_rk = set()
+
+    for f in unique_enc_fields:
+        mapped_to = None
+        
+        # Rule 1: SQL AS alias match
+        if f.lower() in sql_mappings:
+            alias = sql_mappings[f.lower()]
+            if alias in row_keys:
+                mapped_to = alias
+                
+        # Rule 2: Exact or Case-Insensitive FIELD_TRANSLATIONS dictionary mapping
+        if not mapped_to:
+            translated = FIELD_TRANSLATIONS.get(f) or FIELD_TRANSLATIONS.get(f.lower())
+            if translated:
+                if translated in row_keys:
+                    mapped_to = translated
+                else:
+                    # Fuzzy match: check if any row key contains or is contained by the translation
+                    for rk in row_keys:
+                        if translated in rk or rk in translated:
+                            mapped_to = rk
+                            break
+                    if not mapped_to:
+                        mapped_to = translated
+
+        # Rule 3: Already matches a row key directly
+        if not mapped_to and f in row_keys:
+            mapped_to = f
+
+        # Rule 4: Dynamic semantic substring heuristic
+        if not mapped_to:
+            for rk in row_keys:
+                if "homepage" in f.lower() and "首页" in rk:
+                    mapped_to = rk
+                    break
+                if "category" in f.lower() and "分类" in rk:
+                    mapped_to = rk
+                    break
+                if "product" in f.lower() and "商品" in rk:
+                    mapped_to = rk
+                    break
+                if "cart" in f.lower() and "购物车" in rk:
+                    mapped_to = rk
+                    break
+                if ("purchase" in f.lower() or "buy" in f.lower()) and ("购买" in rk or "支付" in rk or "订单" in rk):
+                    mapped_to = rk
+                    break
+                if "browser" in f.lower() and "浏览器" in rk:
+                    mapped_to = rk
+                    break
+                if "user" in f.lower() and "用户" in rk:
+                    mapped_to = rk
+                    break
+                if "channel" in f.lower() and "渠道" in rk:
+                    mapped_to = rk
+                    break
+                if "rate" in f.lower() and "率" in rk:
+                    mapped_to = rk
+                    break
+
+        if mapped_to:
+            final_mappings[f] = mapped_to
+            mapped_rk.add(mapped_to)
+
+    # Rule 5: Positional data-type index alignment fallback for any remaining unmapped fields
+    unmapped_fields = [f for f in unique_enc_fields if f not in final_mappings]
+    if unmapped_fields and row_keys:
+        rem_nominal_rk = [rk for rk in nominal_keys if rk not in mapped_rk]
+        rem_quantitative_rk = [rk for rk in quantitative_keys if rk not in mapped_rk]
+        
+        for f in unmapped_fields:
+            # Determine type (default is quantitative)
+            f_type = "quantitative"
+            enc = obj.get("encoding", {})
+            for enc_ch in enc.values():
+                if isinstance(enc_ch, dict) and enc_ch.get("field") == f:
+                    f_type = str(enc_ch.get("type", "quantitative")).lower()
+                    break
+            
+            if f_type in ("nominal", "ordinal") and rem_nominal_rk:
+                aligned = rem_nominal_rk.pop(0)
+                final_mappings[f] = aligned
+                mapped_rk.add(aligned)
+            elif rem_quantitative_rk:
+                aligned = rem_quantitative_rk.pop(0)
+                final_mappings[f] = aligned
+                mapped_rk.add(aligned)
+            elif rem_nominal_rk:
+                aligned = rem_nominal_rk.pop(0)
+                final_mappings[f] = aligned
+                mapped_rk.add(aligned)
+
+    # 3. Recursively rewrite the Vega spec with aligned mappings
+    def _recurse(item):
+        if isinstance(item, dict):
+            new_dict = {}
+            for k, v in item.items():
+                if k == "values":
+                    new_dict[k] = v
+                elif k == "field" and isinstance(v, str):
+                    new_dict[k] = final_mappings.get(v, v)
+                else:
+                    new_dict[k] = _recurse(v)
+            return new_dict
+        elif isinstance(item, list):
+            return [_recurse(x) for x in item]
+        else:
+            return item
+
+    return _recurse(obj)
+
+
+def vega_to_vchart(spec: dict, sql: str | None = None) -> dict | None:
     """Convert Vega-Lite JSON spec into Feishu VChart spec dictionary.
 
     Returns VChart spec dict if converted successfully, or None for fallback.
     """
     if not isinstance(spec, dict):
         return None
+    
+    # Translate fields in Vega spec dynamically to match data rows
+    spec = translate_spec_fields(spec, sql=sql)
+
     if any(key in spec for key in ("hconcat", "vconcat", "layer")):
         return None
 
@@ -90,6 +324,12 @@ def vega_to_vchart(spec: dict) -> dict | None:
             color_field = enc.get("color", {}).get("field")
             if not x_field or not y_field:
                 return None
+            
+            # Detect horizontal bar charts
+            x_type = str(enc.get("x", {}).get("type", "")).lower()
+            y_type = str(enc.get("y", {}).get("type", "")).lower()
+            is_horizontal = (x_type == "quantitative" or y_type in ["nominal", "ordinal"])
+            
             vchart = {
                 "type": "bar",
                 "title": title_cfg,
@@ -97,6 +337,9 @@ def vega_to_vchart(spec: dict) -> dict | None:
                 "xField": x_field,
                 "yField": y_field,
             }
+            if is_horizontal:
+                vchart["direction"] = "horizontal"
+                
             if color_field:
                 vchart["seriesField"] = color_field
                 vchart["stack"] = False
@@ -356,12 +599,14 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
     # 4.5. Render Chart (Try Feishu Native VChart Component first, fallback to Option A PNG Image)
     vega_cfg = getattr(result, "vega_config", None)
     if vega_cfg:
-        vchart_spec = vega_to_vchart(vega_cfg)
+        sql_str = getattr(result, "sql", None)
+        vega_cfg = translate_spec_fields(vega_cfg, sql=sql_str)
+        vchart_spec = vega_to_vchart(vega_cfg, sql=sql_str)
         if vchart_spec:
             logger.info("Successfully translated Vega spec to Feishu VChart spec!")
             elements.append({
                 "tag": "markdown",
-                "content": "**📈 可视化数据图表 (飞书原生 VChart 渲染)：**"
+                "content": "**📈 可视化数据图表：**"
             })
             elements.append({
                 "tag": "chart",
@@ -417,23 +662,23 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
     #             "type": "default"
     #         })
 
-    # 6. Interactive Actions / Recommended Questions Block
-    if result.recommended_questions:
-        elements.append({
-            "tag": "markdown",
-            "content": "**🚀 快捷追问深度分析：**"
-        })
-        for q in result.recommended_questions[:3]:
-            display_title = q[:18] + "..." if len(q) > 18 else q
-            elements.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": f"💬 {display_title}"},
-                "type": "default",
-                "value": {
-                    "action": "quick_query",
-                    "query": q
-                }
-            })
+    # 6. Interactive Actions / Recommended Questions Block (Temporarily Commented Out)
+    # if result.recommended_questions:
+    #     elements.append({
+    #         "tag": "markdown",
+    #         "content": "**🚀 快捷追问深度分析：**"
+    #     })
+    #     for q in result.recommended_questions[:3]:
+    #         display_title = q[:18] + "..." if len(q) > 18 else q
+    #         elements.append({
+    #             "tag": "button",
+    #             "text": {"tag": "plain_text", "content": f"💬 {display_title}"},
+    #             "type": "default",
+    #             "value": {
+    #                 "action": "quick_query",
+    #                 "query": q
+    #             }
+    #         })
 
     # Create Lark Card Schema 2.0 Content
     card_content = {

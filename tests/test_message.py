@@ -64,3 +64,76 @@ def test_composite_vega_spec_uses_png_fallback():
     }
 
     assert vega_to_vchart(spec) is None
+
+
+def test_feishu_adapter_format_summary_with_map_keys():
+    from app.adapters.feishu import FeishuAdapter
+    adapter = FeishuAdapter()
+
+    # 1. Test standard map keys
+    raw_text = """
+    LOGIC_EXPLANATION: 这是数据提取逻辑，使用了 thelook 数据库进行 GROUP BY。
+
+    BUSINESS_INSIGHTS:
+    1. [周中爆发与回落现象]：
+       - 现象：9月27日出现峰值。
+       - 建议：加强推广。
+    """
+    res = adapter.format_summary(raw_text)
+    assert "**🎯 业务决策洞察：**" in res
+    assert "1. [周中爆发与回落现象]：" in res
+    assert "这是数据提取逻辑" not in res
+
+    # 3. Test that common Chinese terms are NOT stripped from business insights
+    raw_sensitive = """
+    BUSINESS_INSIGHTS:
+    1. [品牌表现统计]：根据我们对销售额的统计，7 For All Mankind 表现优异。
+    2. [决策主要依据]：本次决策以库存字段为依据进行分组 and 分析。
+    """
+    res_sensitive = adapter.format_summary(raw_sensitive)
+    assert "根据我们对销售额的统计" in res_sensitive
+    assert "本次决策以库存字段为依据" in res_sensitive
+
+
+def test_format_summary_with_dirty_brackets():
+    from app.adapters.feishu import FeishuAdapter
+    adapter = FeishuAdapter()
+    raw_text = """
+    BUSINESS_INSIGHTS:
+    )
+    1. [品牌表现统计]：根据我们对销售额的统计，7 For All Mankind 表现优异。
+    """
+    res = adapter.format_summary(raw_text)
+    assert "**🎯 业务决策洞察：**" in res
+    assert "1. [品牌表现统计]：根据我们对销售额的统计" in res
+
+
+def test_format_summary_nested_bullets():
+    import textwrap
+    from app.adapters.feishu import FeishuAdapter
+    adapter = FeishuAdapter()
+    raw_text = textwrap.dedent("""\
+    BUSINESS_INSIGHTS:
+    2. [高库存压力与“库龄老化”危机并存]：
+    - 现象：所有 Top 5 品牌的平均库存库龄均已突破 1100 天 (约合 3 年以上)。
+    - 建议：强烈建议运营 and 仓储部门联合启动“清仓回笼”策略：
+      - 组合折扣：对库龄超 1000 天的高价牛仔。
+      - 跨渠道特卖：将这些陈年库存批量打包至奥特莱斯。""")
+    res = adapter.format_summary(raw_text)
+    assert "2. [高库存压力与“库龄老化”危机并存]：" in res
+    assert "- 现象：所有 Top 5" in res
+    assert "- 建议：强烈建议" in res
+    assert "  - 组合折扣：" in res
+
+
+def test_format_summary_inline_merged_bullets():
+    from app.adapters.feishu import FeishuAdapter
+    adapter = FeishuAdapter()
+    raw_text = """
+    BUSINESS_INSIGHTS:
+    1. 洞察要点一：🔍 现象： Swim (泳装) 品类在中低价位（20-50）段存在显著退货偏高问题。
+    💡 建议：中低价位泳装退货率高，通常与尺码不合、材质弹性不佳或版型描述偏差有关。
+    """
+    res = adapter.format_summary(raw_text)
+    assert "1. 洞察要点一：🔍 现象：" in res
+    assert "💡 建议：" in res

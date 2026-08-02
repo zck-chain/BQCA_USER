@@ -12,6 +12,112 @@ from app.feishu.message import (
 logger = logging.getLogger(__name__)
 
 
+def get_emoji_for_key(key: str) -> str:
+    key_lower = key.lower()
+    if any(k in key_lower for k in ["现象", "发现", "问题", "异常", "原因", "故障", "bug", "error"]):
+        return "🔍"
+    if any(k in key_lower for k in ["建议", "策略", "方案", "改进", "措施", "落地"]):
+        return "💡"
+    if any(k in key_lower for k in ["数据", "指标", "统计", "结果", "数量", "金额", "数值", "rows"]):
+        return "📊"
+    if any(k in key_lower for k in ["结论", "总结", "观点", "洞察", "核心", "summary"]):
+        return "📌"
+    if any(k in key_lower for k in ["折扣", "特卖", "促销", "活动", "优惠", "promo", "discount"]):
+        return "🏷️"
+    if any(k in key_lower for k in ["渠道", "流量", "来源", "channel"]):
+        return "🌐"
+    return "📍"
+
+
+def extract_business_insights(text: str) -> str:
+    """Extract only the BUSINESS_INSIGHTS segment, dropping any LOGIC_EXPLANATION / rule headers."""
+    if not text:
+        return ""
+
+    # 1. Compile regexes for various Business Insights section starts
+    insights_patterns = [
+        r"BUSINESS_INSIGHTS\b",
+        r"BUSINESS_INSIGHT\b",
+        r"【\s*业务洞察\s*】",
+        r"【\s*核心业务洞察与落地建议\s*】",
+        r"###\s*核心业务洞察与落地建议",
+        r"###\s*业务决策洞察",
+        r"核心业务洞察与落地建议",
+        r"业务决策洞察",
+        r"业务洞察",
+        r"落地建议",
+    ]
+    
+    best_insight_idx = -1
+    matched_pattern_len = 0
+    
+    for pattern in insights_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            idx = match.start()
+            if best_insight_idx == -1 or idx < best_insight_idx:
+                best_insight_idx = idx
+                matched_pattern_len = match.end() - match.start()
+                
+    # Same for Logic Explanation to find if it comes after Insights
+    logic_patterns = [
+        r"LOGIC_EXPLANATION\b",
+        r"【\s*逻辑解释\s*】",
+        r"###\s*【\s*逻辑解释\s*】",
+        r"###\s*设计分析概要",
+        r"设计分析概要",
+        r"逻辑解释",
+        r"数据提取逻辑",
+    ]
+    
+    best_logic_idx = -1
+    for pattern in logic_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            idx = match.start()
+            if best_logic_idx == -1 or idx < best_logic_idx:
+                best_logic_idx = idx
+
+    # If Business Insights marker was found
+    if best_insight_idx != -1:
+        # If LOGIC_EXPLANATION is after insights, slice between them
+        if best_logic_idx != -1 and best_logic_idx > best_insight_idx:
+            segment = text[best_insight_idx + matched_pattern_len:best_logic_idx].strip()
+        else:
+            segment = text[best_insight_idx + matched_pattern_len:].strip()
+            
+        segment = re.sub(r"^[\s\:\：\-\*\#\【\】]+", "", segment).strip()
+        return segment
+
+    # 2. Fallback if no explicit Business Insights marker was found:
+    best_logic_idx = -1
+    matched_logic_len = 0
+    for pattern in logic_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            idx = match.start()
+            if best_logic_idx == -1 or idx < best_logic_idx:
+                best_logic_idx = idx
+                matched_logic_len = match.end() - match.start()
+                
+    if best_logic_idx != -1:
+        remaining_text = text[best_logic_idx + matched_logic_len:].strip()
+        numbered_match = re.search(r"^\s*1\.\s+", remaining_text, re.MULTILINE)
+        if numbered_match:
+            analysis_match = re.search(r"(?:现象|建议)", remaining_text)
+            if analysis_match:
+                sub_str = remaining_text[:analysis_match.start()]
+                numbered_items = list(re.finditer(r"(?:^|\n)\s*(\d+\.)\s+", sub_str))
+                if numbered_items:
+                    start_pos = numbered_items[-1].start()
+                    return remaining_text[start_pos:].strip()
+            return remaining_text
+            
+        return remaining_text
+
+    return text.strip()
+
+
 def extract_thoughts_and_summary(raw_text: str) -> tuple[list[str], str]:
     """Split raw BQCA summary into English thoughts and Chinese report."""
     if not raw_text:
@@ -60,49 +166,7 @@ def extract_thoughts_and_summary(raw_text: str) -> tuple[list[str], str]:
 
 def clean_technical_lines(text: str) -> str:
     """Filter out purely technical SQL generation noise lines from summary."""
-    if not text:
-        return ""
-        
-    lines = text.split("\n")
-    cleaned_lines = []
-    
-    def is_technical_line(line: str) -> bool:
-        s = line.strip()
-        if not s:
-            return False
-        tech_indicators = [
-            "SQL", "GROUP BY", "SELECT", "INNER JOIN", "LEFT JOIN", 
-            "WHERE", "ORDER BY", "LIMIT", "去重订单总数", "分组",
-            "字段", "的记录", "表中的", "为依据", "的统计", "的检索"
-        ]
-        return any(ind in s for ind in tech_indicators)
-
-    i = 0
-    n = len(lines)
-    while i < n:
-        line = lines[i]
-        stripped = line.strip()
-        
-        if re.match(r"^\d+\.\s*\*\*(?:模式|技术|逻辑|筛选|检索|计算|关联|表)\w*\*\*", stripped):
-            i += 1
-            while i < n:
-                if not lines[i].strip():
-                    i += 1
-                    continue
-                if is_technical_line(lines[i]):
-                    i += 1
-                else:
-                    break
-            continue
-            
-        if is_technical_line(line):
-            i += 1
-            continue
-            
-        cleaned_lines.append(line)
-        i += 1
-        
-    return "\n".join(cleaned_lines).strip()
+    return text
 
 
 def clean_latex(s: str) -> str:
@@ -117,7 +181,7 @@ def clean_latex(s: str) -> str:
     s = s.replace(r"\$", "$").replace(r"\\$", "$")
     s = re.sub(r"\$\s*([≥≤≈a-zA-Z0-9%\s]+)\s*\$", r"\1", s)
     s = s.replace("$", "").replace("\\", "")
-    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"(?<=[\S])[ \t]+", " ", s)
     s = re.sub(r"\n\s*\n+", "\n\n", s)
     s = s.replace(" 件 。", "件。").replace(" % ) 。", "%)。").replace(" % ", "%")
     return s.strip()
@@ -131,8 +195,8 @@ class FeishuAdapter(BaseCardAdapter):
         if not text:
             return ""
 
-        text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?业务(?:决策)?洞察(?:与建议)?(?:】|\])?", "【业务决策洞察】", text)
-        text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?逻辑解释(?:】|\])?", "【逻辑解释】", text)
+        text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?(?:BUSINESS_INSIGHTS|BUSINESS_INSIGHT|业务决策洞察|业务洞察|核心业务洞察与落地建议)(?:】|\])?\s*(：|:)?", "【业务决策洞察】", text, flags=re.IGNORECASE)
+        text = re.sub(r"(?:###|##|#)?\s*\d*\.?\s*(?:【|\[)?(?:LOGIC_EXPLANATION|逻辑解释|设计分析概要|数据提取逻辑)(?:】|\])?\s*(：|:)?", "【逻辑解释】", text, flags=re.IGNORECASE)
 
         intro_part = ""
         logic_part = ""
