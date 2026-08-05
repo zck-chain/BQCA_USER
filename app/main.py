@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import json
 import logging
 import re
-import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -14,12 +13,21 @@ from app.bqca.client import chat, extract_html_from_summary
 from app.storage.gcs import upload_html, generate_query_id
 from app.adapters import get_card_adapter
 from app.adapters.feishu import extract_thoughts_and_summary
-from app.feishu.event import extract_question, get_message_id, get_chat_id, get_sender_id, parse_card_action, extract_app_id, is_bot_mentioned
+from app.feishu.event import (
+    extract_app_id,
+    extract_question,
+    get_chat_id,
+    get_event_id,
+    get_message_id,
+    get_sender_id,
+    is_bot_mentioned,
+    is_event_expired,
+    parse_card_action,
+)
 from app.feishu.message import send_text_message, send_result_card, send_premium_result_card
 from app.storage.sqlite import (
     init_db,
-    is_message_processed,
-    add_processed_message,
+    claim_message_processing,
     get_chat_conversation,
     save_chat_conversation,
     get_role_session,
@@ -34,6 +42,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SESSION_TTL = 86400 * 30  # 30 days
+FEISHU_EVENT_MAX_AGE_SECONDS = 600  # Demo guard against delayed callback retries
 
 DEMO_ROLES = {"运营经理", "一线客服"}
 ROLE_ALIASES = {
@@ -223,24 +232,27 @@ async def webhook_event(request: Request):
     body = await request.json()
     app_id = extract_app_id(body)
 
+    # Feishu URL verification
+    if body.get("type") == "url_verification":
+        return {"challenge": body.get("challenge")}
+
+    event = body.get("event", {})
+    event_id = get_event_id(body)
+    msg_id = get_message_id(event)
+    if is_event_expired(body, FEISHU_EVENT_MAX_AGE_SECONDS):
+        logger.warning("Skipping expired Feishu event: event_id=%s msg_id=%s", event_id, msg_id)
+        return {"status": "ok"}
+
+    if not claim_message_processing(msg_id, event_id):
+        logger.info("Skipping duplicate Feishu event: event_id=%s msg_id=%s", event_id, msg_id)
+        return {"status": "ok"}
+
     # Handle Feishu Card Action Event (One-click quick query)
     next_query, target_id = parse_card_action(body, get_chat_type, _get_conversation)
     if next_query and target_id:
         logger.info("Feishu Card Action click: %r target_id %s, app_id %s", next_query, target_id, app_id)
         asyncio.create_task(_process_query(next_query, target_id, app_id=app_id))
         return {}
-
-    # Feishu URL verification
-    if body.get("type") == "url_verification":
-        return {"challenge": body.get("challenge")}
-
-    # Handle message event
-    event = body.get("event", {})
-
-    msg_id = get_message_id(event)
-    if is_message_processed(msg_id):
-        return {"status": "ok"}
-    add_processed_message(msg_id)
 
     logger.info("Feishu event: %s", json.dumps(event, ensure_ascii=False)[:500])
 

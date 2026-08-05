@@ -60,24 +60,36 @@ def init_db() -> None:
 # 1. Processed messages helper functions
 # ---------------------------------------------------------------------------
 
-def is_message_processed(msg_id: str) -> bool:
-    """Check if a message ID has already been processed to prevent duplicates."""
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM processed_messages WHERE msg_id = ?", (msg_id,))
-        return cursor.fetchone() is not None
+def claim_message_processing(msg_id: str, event_id: str = "") -> bool:
+    """Atomically claim a Feishu event. Return False when either ID was seen."""
+    keys = []
+    if msg_id:
+        keys.append(msg_id)
+    if event_id:
+        keys.append(f"event:{event_id}")
+    if not keys:
+        return True
 
-def add_processed_message(msg_id: str) -> None:
-    """Add a message ID to the processed list."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO processed_messages (msg_id, processed_at) VALUES (?, ?)",
-                (msg_id, time.time())
+            conn.execute("BEGIN IMMEDIATE")
+            placeholders = ", ".join("?" for _ in keys)
+            existing = conn.execute(
+                f"SELECT 1 FROM processed_messages WHERE msg_id IN ({placeholders}) LIMIT 1",
+                keys,
+            ).fetchone()
+            if existing:
+                return False
+
+            conn.executemany(
+                "INSERT INTO processed_messages (msg_id, processed_at) VALUES (?, ?)",
+                [(key, time.time()) for key in keys],
             )
             conn.commit()
+            return True
     except Exception as e:
-        logger.error("Failed to add processed message %s: %s", msg_id, e)
+        logger.error("Failed to claim Feishu event %s/%s: %s", event_id, msg_id, e)
+        return True
 
 # ---------------------------------------------------------------------------
 # 2. Chat sessions (Feishu Webhook) helper functions

@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 
 from app.config import settings
 
@@ -23,6 +24,33 @@ def extract_app_id(body: dict) -> str | None:
     if isinstance(event, dict) and event.get("app_id"):
         return event.get("app_id")
     return body.get("app_id")
+
+
+def get_event_id(body: dict) -> str:
+    """Get the Feishu v2 event ID used for callback deduplication."""
+    header = body.get("header", {})
+    return header.get("event_id", "") if isinstance(header, dict) else ""
+
+
+def is_event_expired(body: dict, max_age_seconds: float, now: float | None = None) -> bool:
+    """Return whether a Feishu message callback is older than the accepted window."""
+    event = body.get("event", {})
+    message = event.get("message", {}) if isinstance(event, dict) else {}
+    header = body.get("header", {})
+    raw_timestamp = message.get("create_time")
+    if raw_timestamp is None and isinstance(header, dict):
+        raw_timestamp = header.get("create_time")
+    if raw_timestamp is None:
+        return False
+
+    try:
+        timestamp = float(raw_timestamp)
+        while timestamp > 100_000_000_000:
+            timestamp /= 1000
+    except (TypeError, ValueError):
+        return False
+
+    return (time.time() if now is None else now) - timestamp > max_age_seconds
 
 
 def extract_question(event: dict) -> str:
@@ -131,4 +159,3 @@ def parse_card_action(body: dict, get_chat_type_fn, get_conversation_fn) -> tupl
                         target_id = open_id
                 return next_query, target_id
     return None, None
-

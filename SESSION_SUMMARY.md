@@ -108,7 +108,10 @@ gcloud run deploy bqca-bot \
   --project webeye-internal-test \
   --allow-unauthenticated \
   --service-account=bqca-runner@webeye-internal-test.iam.gserviceaccount.com \
-  --env-vars-file=.env
+  --env-vars-file=.env \
+  --min-instances=1 \
+  --max-instances=1 \
+  --no-cpu-throttling
 ```
 
 健康检查验证：

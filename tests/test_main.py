@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from fastapi.testclient import TestClient
@@ -49,6 +51,50 @@ def test_handle_message_event():
       resp = client.post("/webhook/event", json=event)
 
   assert resp.status_code == 200
+
+
+def _message_event(event_id: str, message_id: str, create_time: str | None = None) -> dict:
+  message = {
+      "message_id": message_id,
+      "chat_id": "oc_test",
+      "chat_type": "p2p",
+      "content": '{"text":"查看订单数量"}',
+      "message_type": "text",
+  }
+  if create_time is not None:
+      message["create_time"] = create_time
+
+  return {
+      "header": {"event_id": event_id},
+      "event": {
+          "message": message,
+          "sender": {"sender_id": {"open_id": "ou_001"}},
+      },
+  }
+
+
+def test_webhook_deduplicates_by_event_id_when_message_id_changes():
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      first = client.post("/webhook/event", json=_message_event("evt_same", "msg_001"))
+      second = client.post("/webhook/event", json=_message_event("evt_same", "msg_002"))
+
+  assert first.status_code == 200
+  assert second.status_code == 200
+  mock_process.assert_awaited_once()
+
+
+def test_webhook_ignores_message_older_than_ten_minutes():
+  old_create_time = str(int((time.time() - 601) * 1000))
+
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post(
+          "/webhook/event",
+          json=_message_event("evt_old", "msg_old", old_create_time),
+      )
+
+  assert resp.status_code == 200
+  assert resp.json() == {"status": "ok"}
+  mock_process.assert_not_awaited()
 
 
 def test_feishu_query_defaults_role_for_new_session():

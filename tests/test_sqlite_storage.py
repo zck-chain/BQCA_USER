@@ -1,6 +1,16 @@
 from app.storage import sqlite as sqlite_storage
 
 
+def test_claim_message_processing_deduplicates_event_and_message_ids(tmp_path, monkeypatch):
+    db_path = tmp_path / "bqca_sessions.db"
+    monkeypatch.setattr(sqlite_storage, "DB_PATH", str(db_path))
+    sqlite_storage.init_db()
+
+    assert sqlite_storage.claim_message_processing("msg_001", "evt_001") is True
+    assert sqlite_storage.claim_message_processing("msg_002", "evt_001") is False
+    assert sqlite_storage.claim_message_processing("msg_001", "evt_002") is False
+
+
 def test_init_db_does_not_attempt_duplicate_last_domain_migration(monkeypatch):
     class FakeConnection:
         def __enter__(self):
