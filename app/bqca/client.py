@@ -1,6 +1,9 @@
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import google.auth
 from google.auth import impersonated_credentials
@@ -33,6 +36,7 @@ class ChatResult:
     vega_config: dict | None = None
     thinking_process: list[str] = field(default_factory=list)
     recommended_questions: list[str] = field(default_factory=list)
+    first_chunk_latency: float = 0.0
 
 
 def _agent_path(agent_id: str | None = None, location: str | None = None) -> str:
@@ -144,8 +148,37 @@ def chat(question: str, conversation_name: str | None = None,
     final_text_messages: list[str] = []
     legacy_text_messages: list[str] = []
 
+    start_time = time.time()
+    first_chunk_time = None
+    chunk_index = 0
+    stream_dump_records: list[dict] = []
+
     for message in chat_client.chat(request=req):
+        chunk_index += 1
+        current_time = time.time()
+        elapsed_sec = round(current_time - start_time, 3)
+        elapsed_ms = int((current_time - start_time) * 1000)
+
         sm_dict = MessageToDict(message.system_message._pb)
+        full_msg_dict = MessageToDict(message._pb)
+
+        is_ai_content = ("text" in sm_dict or "data" in sm_dict or "chart" in sm_dict)
+
+        if is_ai_content and first_chunk_time is None:
+            first_chunk_time = current_time
+            ttft_sec = elapsed_sec
+            result.first_chunk_latency = ttft_sec
+            logger.info("⏱️ [TELEMETRY-TTFT] True AI First stream chunk received from BQCA: +%.3f s (+%d ms)", ttft_sec, elapsed_ms)
+
+        dump_record = {
+            "chunk_index": chunk_index,
+            "elapsed_seconds": elapsed_sec,
+            "elapsed_ms": elapsed_ms,
+            "is_ai_content": is_ai_content,
+            "system_message": sm_dict,
+            "full_message": full_msg_dict,
+        }
+        stream_dump_records.append(dump_record)
 
         if "text" in sm_dict:
             text_obj = sm_dict["text"]
@@ -199,6 +232,31 @@ def chat(question: str, conversation_name: str | None = None,
         result.summary = "\n".join(final_text_messages)
     elif legacy_text_messages:
         result.summary = "\n".join(legacy_text_messages)
+
+    # Dump all stream chunks with timing to a unique timestamped JSON file per question in scratch/
+    try:
+        scratch_dir = Path(__file__).resolve().parent.parent.parent / "scratch"
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+        
+        time_str = time.strftime("%Y%m%d_%H%M%S")
+        safe_q = re.sub(r"[^\w\u4e00-\u9fa5]", "_", question[:20]).strip("_") or "query"
+        dump_filename = f"stream_dump_{time_str}_{safe_q}.json"
+        dump_file = scratch_dir / dump_filename
+        
+        dump_payload = {
+            "question": question,
+            "conversation_name": conversation_name,
+            "total_chunks": len(stream_dump_records),
+            "ai_first_chunk_latency_seconds": result.first_chunk_latency,
+            "total_duration_seconds": round(time.time() - start_time, 3),
+            "chunks": stream_dump_records
+        }
+        
+        with open(dump_file, "w", encoding="utf-8") as f:
+            json.dump(dump_payload, f, ensure_ascii=False, indent=2)
+        logger.info("📁 [STREAM-DUMP] Saved %d raw stream chunks to %s", len(stream_dump_records), dump_file)
+    except Exception as err:
+        logger.warning("Failed to save stream dump JSON: %s", err)
 
     logger.info("BQCA chat done: %d rows, sql=%s, chart=%s, sa=%s",
                  len(result.rows), bool(result.sql), bool(result.vega_config),

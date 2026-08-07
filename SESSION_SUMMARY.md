@@ -111,7 +111,10 @@ gcloud run deploy bqca-bot \
   --env-vars-file=.env \
   --min-instances=1 \
   --max-instances=1 \
-  --no-cpu-throttling
+  --cpu=2 \
+  --memory=2Gi \
+  --no-cpu-throttling \
+  --timeout=300s
 ```
 
 健康检查验证：

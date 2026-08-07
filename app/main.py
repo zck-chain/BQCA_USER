@@ -3,10 +3,13 @@ from dataclasses import dataclass
 import json
 import logging
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import FileResponse
 
 from app.config import settings
 from app.bqca.client import chat, extract_html_from_summary
@@ -152,6 +155,28 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/stream-dumps")
+async def list_stream_dumps():
+    """List all stream dump JSON files generated inside the Cloud Run container."""
+    scratch_dir = Path(__file__).resolve().parent.parent / "scratch"
+    if not scratch_dir.exists():
+        return {"files": []}
+    files = sorted([f.name for f in scratch_dir.glob("stream_dump_*.json")], reverse=True)
+    return {"files": files}
+
+
+@app.get("/api/stream-dumps/{filename}")
+async def get_stream_dump(filename: str):
+    """Download a specific stream dump JSON file generated inside the Cloud Run container."""
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    scratch_dir = Path(__file__).resolve().parent.parent / "scratch"
+    file_path = scratch_dir / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Stream dump file not found")
+    return FileResponse(path=file_path, filename=filename, media_type="application/json")
+
+
 @app.post("/api/query")
 async def api_query(request: Request):
     """
@@ -220,6 +245,7 @@ async def api_query(request: Request):
             "html_url": None,  # TODO: 恢复 html_url
             "session_id": session_id,
             "conversation_id": result.conversation_name,
+            "first_chunk_latency": result.first_chunk_latency,
             "role": role,
         }
     except Exception as e:
@@ -227,8 +253,105 @@ async def api_query(request: Request):
         raise HTTPException(status_code=500, detail="query failed")
 
 
+@app.post("/api/benchmark")
+async def api_benchmark(request: Request):
+    """
+    In-container performance benchmark endpoint (Ecommerce domain).
+    Executes 2 distinct layers concurrently in the same Cloud Run environment:
+    1. Pure BQCA SDK call (chat).
+    2. Real /api/query endpoint handler (api_query).
+    """
+    body = await request.json()
+    question = body.get("question", "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required in request body")
+
+    results = {
+        "question": question,
+        "domain": "ecommerce",
+        "environment": "Google Cloud Run Container (Same Intra-VPC Network)",
+        "mode": "Concurrent Execution (asyncio.gather)",
+    }
+    
+    async def run_step_1():
+        t0 = time.perf_counter()
+        try:
+            agent_cfg = get_agent_config("ecommerce")
+            sdk_res = await asyncio.to_thread(
+                chat,
+                question,
+                None,  # 建立全新的独立对话
+                agent_id=agent_cfg.agent_id,
+                location=agent_cfg.location,
+            )
+            t_sdk = time.perf_counter() - t0
+            return {
+                "name": "1. BQCA SDK 直连 (chat)",
+                "duration_seconds": round(t_sdk, 3),
+                "duration_ms": round(t_sdk * 1000, 0),
+                "rows_count": len(sdk_res.rows),
+                "has_sql": bool(sdk_res.sql),
+                "success": True,
+            }
+        except Exception as e:
+            return {"name": "1. BQCA SDK 直连 (chat)", "success": False, "error": str(e)}
+
+    async def run_step_2():
+        t0 = time.perf_counter()
+        try:
+            mock_api_req = Request(
+                scope={
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/api/query",
+                    "headers": [(b"content-type", b"application/json")],
+                }
+            )
+            mock_api_req._json = {
+                "question": question,
+                "domain": "ecommerce",
+                "session_id": f"bm_session_{uuid.uuid4().hex}"
+            }
+            query_resp = await api_query(mock_api_req)
+            t_query = time.perf_counter() - t0
+            return {
+                "name": "2. /api/query 路由处理函数 (api_query)",
+                "duration_seconds": round(t_query, 3),
+                "duration_ms": round(t_query * 1000, 0),
+                "has_sql": bool(query_resp.get("sql")),
+                "has_chart": bool(query_resp.get("vega_config")),
+                "success": True,
+            }
+        except Exception as e:
+            return {"name": "2. /api/query 路由处理函数 (api_query)", "success": False, "error": str(e)}
+
+    t_global_start = time.perf_counter()
+    # ⚡ 使用 asyncio.gather 实现步骤 1 与 步骤 2 瞬间完全同时并发发起
+    res_1, res_2 = await asyncio.gather(run_step_1(), run_step_2())
+    total_parallel_time = round(time.perf_counter() - t_global_start, 3)
+
+    results["step_1_sdk_direct"] = res_1
+    results["step_2_api_query"] = res_2
+    results["total_parallel_wall_time_seconds"] = total_parallel_time
+
+    if res_1.get("success") and res_2.get("success"):
+        s1 = res_1["duration_seconds"]
+        s2 = res_2["duration_seconds"]
+        overhead = round(s2 - s1, 3)
+        results["overhead_analysis"] = {
+            "sdk_time": f"{s1}s",
+            "api_query_time": f"{s2}s",
+            "framework_and_code_overhead": f"{overhead}s ({round(overhead * 1000, 0)}ms)",
+            "total_parallel_time": f"{total_parallel_time}s",
+            "conclusion": "FastAPI 代码层开销极小，表现优秀！" if abs(overhead) < 0.5 else "观察数据格式化或内部 Session 保存开销。",
+        }
+
+    return results
+
+
 @app.post("/webhook/event")
 async def webhook_event(request: Request):
+    t_webhook_start = time.perf_counter()
     body = await request.json()
     app_id = extract_app_id(body)
 
@@ -252,6 +375,8 @@ async def webhook_event(request: Request):
     if next_query and target_id:
         logger.info("Feishu Card Action click: %r target_id %s, app_id %s", next_query, target_id, app_id)
         asyncio.create_task(_process_query(next_query, target_id, app_id=app_id))
+        t_handshake = time.perf_counter() - t_webhook_start
+        logger.info("⏱️ [TELEMETRY-HANDSHAKE] /webhook/event Card Action HTTP 200 Handshake: %.3f s (%.0f ms)", t_handshake, t_handshake * 1000)
         return {}
 
     logger.info("Feishu event: %s", json.dumps(event, ensure_ascii=False)[:500])
@@ -277,18 +402,26 @@ async def webhook_event(request: Request):
 
     asyncio.create_task(_process_query(question, target_id, app_id=app_id))
 
+    t_handshake = time.perf_counter() - t_webhook_start
+    logger.info("⏱️ [TELEMETRY-HANDSHAKE] /webhook/event Message Event HTTP 200 Handshake: %.3f s (%.0f ms)", t_handshake, t_handshake * 1000)
+
     return {"status": "ok"}
 
 
 async def _process_query(question: str, chat_id: str, platform: str = "feishu", app_id: str | None = None):
     """Query BQCA and reply using platform Card Adapter (Feishu, DingTalk, WeCom, etc.)."""
+    t_pipe_start = time.perf_counter()
     adapter = get_card_adapter(platform)
     agent_cfg = get_agent_config(app_id=app_id)
     try:
         await adapter.send_text_message(chat_id, "正在查询，请稍候...", app_id=app_id)
+        t_ack = time.perf_counter()
+        logger.info("⏱️ [TELEMETRY-ACK] Initial progress message sent to Feishu: +%.3f s (+%.0f ms)", t_ack - t_pipe_start, (t_ack - t_pipe_start) * 1000)
 
         session_key = _scoped_conversation_key(chat_id, agent_cfg.domain)
         conversation_name = _get_conversation(session_key)
+
+        t_bqca_start = time.perf_counter()
         result = await asyncio.to_thread(
             chat,
             question,
@@ -296,6 +429,8 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
             agent_id=agent_cfg.agent_id,
             location=agent_cfg.location,
         )
+        t_bqca_end = time.perf_counter()
+        logger.info("⏱️ [TELEMETRY-BQCA] BQCA Chat execution finished: +%.3f s (BQCA API duration: %.3f s)", t_bqca_end - t_pipe_start, t_bqca_end - t_bqca_start)
 
         # Save conversation for follow-up questions
         _save_conversation(session_key, result.conversation_name)
@@ -341,6 +476,7 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
         # Format summary via Card Adapter
         formatted_summary = adapter.format_summary(clean_summary)
 
+        t_card_start = time.perf_counter()
         await adapter.send_result_card(
             target_id=chat_id,
             question=question,
@@ -352,6 +488,25 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
             result_url=result_url,
             vega_config=result.vega_config,
             app_id=app_id,
+        )
+        t_pipe_end = time.perf_counter()
+
+        # 终极高清晰耗时埋点日志输出
+        logger.info(
+            "\n"
+            "======================================================================\n"
+            "📊 飞书 Webhook 异步流水线完整耗时报告 (FEISHU TELEMETRY REPORT)\n"
+            "======================================================================\n"
+            "1. 飞书消息初次 ACK 提示发送耗时 : %.3f s (%.0f ms)\n"
+            "2. BQCA 智能体与 BigQuery 查数耗时: %.3f s (%.0f ms)\n"
+            "3. 飞书卡片与图表渲染推送总耗时   : %.3f s (%.0f ms)\n"
+            "----------------------------------------------------------------------\n"
+            "🔥 飞书用户端到端总等待时间     : %.3f s (%.0f ms)\n"
+            "======================================================================",
+            t_ack - t_pipe_start, (t_ack - t_pipe_start) * 1000,
+            t_bqca_end - t_bqca_start, (t_bqca_end - t_bqca_start) * 1000,
+            t_pipe_end - t_card_start, (t_pipe_end - t_card_start) * 1000,
+            t_pipe_end - t_pipe_start, (t_pipe_end - t_pipe_start) * 1000
         )
 
     except Exception as e:
