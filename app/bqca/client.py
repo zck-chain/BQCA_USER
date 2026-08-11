@@ -289,7 +289,7 @@ async def chat_stream_events(
     and yields events to caller in real-time!
     """
     credentials = _get_credentials(target_service_account)
-    chat_client = _get_client(credentials, target_sa=target_service_account)
+    chat_client = _get_client(credentials)
 
     if conversation_name is None:
         conversation_name = create_conversation(credentials, agent_id=agent_id, location=location)

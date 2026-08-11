@@ -1,3 +1,4 @@
+import hmac
 import json
 import logging
 import re
@@ -8,11 +9,49 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-def verify_token(token: str) -> bool:
-  """Verify Feishu event token."""
-  if not settings.FEISHU_VERIFICATION_TOKEN:
-      return False
-  return token == settings.FEISHU_VERIFICATION_TOKEN
+def _expected_token(app_id: str | None = None) -> str:
+    """Return the verification token configured for the bot that owns `app_id`.
+
+    The game bot and the ecommerce bot use separate Feishu apps and therefore
+    separate verification tokens. Returns "" when no token is configured for the
+    resolved app (callers treat empty as "auth disabled").
+    """
+    if app_id and settings.GAME_FEISHU_APP_ID and app_id == settings.GAME_FEISHU_APP_ID:
+        return settings.GAME_FEISHU_VERIFICATION_TOKEN or ""
+    return settings.FEISHU_VERIFICATION_TOKEN or ""
+
+
+def extract_event_token(body: dict) -> str:
+    """Extract the verification token from a Feishu event payload.
+
+    Feishu v2 (schema 2.0) events carry it in `header.token`; legacy v1 events
+    and url_verification carry it at the top level as `token`.
+    """
+    if not isinstance(body, dict):
+        return ""
+    header = body.get("header")
+    if isinstance(header, dict) and header.get("token"):
+        return header.get("token") or ""
+    return body.get("token") or ""
+
+
+def verify_token(token: str, app_id: str | None = None) -> bool:
+    """Verify a Feishu event verification token against the configured bot token.
+
+    Returns True when the expected token is not configured (auth disabled, e.g.
+    local development) OR when the provided token matches (constant-time).
+    """
+    expected = _expected_token(app_id)
+    if not expected:
+        return True
+    if not token:
+        return False
+    return hmac.compare_digest(token, expected)
+
+
+def verify_event(body: dict, app_id: str | None = None) -> bool:
+    """Convenience: verify the token carried on a parsed Feishu event body."""
+    return verify_token(extract_event_token(body), app_id=app_id)
 
 
 def extract_app_id(body: dict) -> str | None:

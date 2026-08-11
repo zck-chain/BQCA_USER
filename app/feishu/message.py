@@ -838,6 +838,87 @@ async def patch_progress_card(message_id: str, question: str, status_text: str, 
         return False
 
 
+async def patch_partial_summary(
+    message_id: str,
+    question: str,
+    thoughts: list[str] | None,
+    partial_summary: str,
+    stage: str = "",
+    app_id: str | None = None,
+) -> bool:
+    """Streaming in-place PATCH: collapsible thought chain + progressively arriving insight text.
+
+    Called on the trailing edge of the SUMMARY throttle so the card shows the AI's
+    reasoning and the partial BUSINESS_INSIGHTS text as blocks arrive, before the
+    final card (data table / chart) replaces it.
+    """
+    if not message_id:
+        return False
+    token = await _get_tenant_token(app_id=app_id)
+
+    elements = [
+        {
+            "tag": "markdown",
+            "content": f"**🔍 提问问题：**\n{question}"
+        }
+    ]
+
+    if thoughts:
+        thought_lines = "\n".join(f"- {t}" for t in thoughts if t)
+        if thought_lines:
+            elements.append({
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"🧠 思考过程（{len(thoughts)} 步）"}
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": thought_lines
+                    }
+                ]
+            })
+
+    if partial_summary:
+        elements.append({
+            "tag": "markdown",
+            "content": partial_summary
+        })
+
+    status = stage or "✍️ *正在生成商业洞察...*"
+    elements.append({
+        "tag": "markdown",
+        "content": status
+    })
+
+    card_content = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "template": "indigo",
+            "title": {"tag": "plain_text", "content": "📊 BQCA 智能数据分析"}
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": elements
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.patch(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "content": json.dumps(card_content),
+            },
+        )
+        resp_json = resp.json()
+        if resp.status_code == 200 and resp_json.get("code") == 0:
+            logger.info("Streaming partial summary PATCH updated (message_id=%s).", message_id)
+            return True
+        logger.error("Failed to PATCH partial summary message_id %s: %s", message_id, resp_json)
+        return False
 
 
 

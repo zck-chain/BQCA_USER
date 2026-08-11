@@ -81,12 +81,8 @@ async def test_chat_stream_emits_summary_blocks_incrementally():
         {"text": {"textType": "FINAL_RESPONSE", "parts": ["第二段洞察"]}},
     ]
 
-    async def _fake_session(*args, **kwargs):
-        return "projects/test/locations/global/conversations/abc"
-
     with patch("app.bqca.client._get_credentials", return_value=None), \
          patch("app.bqca.client._get_client", return_value=mock_client), \
-         patch("app.bqca.client.conversation_pool.get_session", side_effect=_fake_session), \
          patch("app.bqca.client.MessageToDict", side_effect=stream_messages):
         events = []
         async for event in chat_stream_events(
@@ -106,3 +102,36 @@ async def test_chat_stream_emits_summary_blocks_incrementally():
     final = [e for e in events if e.event_type == BQCAEventType.FINAL][-1]
     assert final.result.summary == "第一段洞察\n第二段洞察"
     assert types[-1] == BQCAEventType.FINAL
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_uses_real_get_client_signature():
+    """Smoke test: chat_stream_events must call the real _get_client(credentials).
+
+    Regression guard for the production crash where it passed a non-existent
+    `target_sa=` kwarg. We do NOT mock _get_client — only the underlying gRPC
+    client constructor — so a signature mismatch raises TypeError here instead
+    of on every production request.
+    """
+    mock_client = MagicMock()
+    mock_client.chat.return_value = []
+    stream_messages = [
+        {"text": {"textType": "FINAL_RESPONSE", "parts": ["完成"]}},
+    ]
+
+    with patch("app.bqca.client._get_credentials", return_value=None), \
+         patch("app.bqca.client.geminidataanalytics.DataChatServiceClient",
+               return_value=mock_client) as ctor, \
+         patch("app.bqca.client.MessageToDict", side_effect=stream_messages):
+        events = []
+        async for event in chat_stream_events(
+            "分析",
+            conversation_name="projects/test/locations/global/conversations/abc",
+        ):
+            events.append(event)
+
+    # The real _get_client takes exactly one credentials arg; with None it
+    # constructs the default client with no constructor kwargs. A stale extra
+    # kwarg (e.g. target_sa=...) would have raised TypeError before reaching here.
+    ctor.assert_called_once_with()
+    assert [e.event_type for e in events][-1] == BQCAEventType.FINAL

@@ -44,6 +44,20 @@ def isolated_sqlite_db(tmp_path, monkeypatch):
   yield
 
 
+@pytest.fixture(autouse=True)
+def _disable_feishu_verification(monkeypatch):
+  """Default webhook tests to auth-disabled (no token configured).
+
+  The real .env sets verification tokens; without this, every synthetic webhook
+  POST would be rejected with 401. Auth-specific tests re-enable a known token.
+  """
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_VERIFICATION_TOKEN", "")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_APP_ID", "game-app")
+  yield
+
+
 def test_health():
   resp = client.get("/health")
   assert resp.status_code == 200
@@ -58,6 +72,90 @@ def test_webhook_challenge():
   })
   assert resp.status_code == 200
   assert resp.json()["challenge"] == "test_challenge"
+
+
+def test_webhook_rejects_event_with_wrong_token(monkeypatch):
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "secret-token")
+
+  event = {
+      "header": {"event_id": "evt_bad", "token": "wrong-token"},
+      "event": {
+          "message": {
+              "message_id": "msg_bad",
+              "chat_id": "oc_test",
+              "chat_type": "p2p",
+              "content": '{"text":"查看订单"}',
+              "message_type": "text",
+          },
+          "sender": {"sender_id": {"open_id": "ou_1"}},
+      },
+  }
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 401
+  mock_process.assert_not_awaited()
+
+
+def test_webhook_accepts_event_with_correct_v2_header_token(monkeypatch):
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "secret-token")
+
+  event = {
+      "header": {"event_id": "evt_ok", "token": "secret-token"},
+      "event": {
+          "message": {
+              "message_id": "msg_ok",
+              "chat_id": "oc_test",
+              "chat_type": "p2p",
+              "content": '{"text":"查看订单"}',
+              "message_type": "text",
+          },
+          "sender": {"sender_id": {"open_id": "ou_1"}},
+      },
+  }
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 200
+  mock_process.assert_awaited_once()
+
+
+def test_webhook_uses_game_token_for_game_app(monkeypatch):
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "ecom-token")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_VERIFICATION_TOKEN", "game-token")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_APP_ID", "game-app")
+
+  # Event tagged with the game app_id but carrying the ecommerce token must be rejected.
+  event = {
+      "header": {
+          "event_id": "evt_game",
+          "token": "ecom-token",
+          "app_id": "game-app",
+      },
+      "event": {
+          "app_id": "game-app",
+          "message": {
+              "message_id": "msg_game",
+              "chat_id": "oc_game",
+              "chat_type": "p2p",
+              "content": '{"text":"DAU"}',
+              "message_type": "text",
+          },
+          "sender": {"sender_id": {"open_id": "ou_g"}},
+      },
+  }
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 401
+  mock_process.assert_not_awaited()
+
+  # ...and accepted with the game token.
+  event["header"]["token"] = "game-token"
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 200
+  mock_process.assert_awaited_once()
 
 
 def test_handle_message_event():
