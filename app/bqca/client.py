@@ -8,7 +8,6 @@ from google.cloud import geminidataanalytics
 from google.protobuf.json_format import MessageToDict
 
 from app.config import settings
-from app.bqca.pool import conversation_pool
 
 logger = logging.getLogger(__name__)
 
@@ -79,21 +78,11 @@ def _get_credentials(target_sa: str | None = None):
     return imp_creds
 
 
-_CLIENT_CACHE: dict[str, geminidataanalytics.DataChatServiceClient] = {}
-
-def _get_client(credentials=None, target_sa: str | None = None) -> geminidataanalytics.DataChatServiceClient:
-    """Get or create a cached DataChatServiceClient singleton to reuse gRPC channel and TLS connection."""
-    cache_key = target_sa or "default"
-    if cache_key in _CLIENT_CACHE:
-        return _CLIENT_CACHE[cache_key]
-
+def _get_client(credentials=None) -> geminidataanalytics.DataChatServiceClient:
+    """Create a DataChatServiceClient, optionally with specific credentials."""
     if credentials is None:
-        client = geminidataanalytics.DataChatServiceClient()
-    else:
-        client = geminidataanalytics.DataChatServiceClient(credentials=credentials)
-
-    _CLIENT_CACHE[cache_key] = client
-    return client
+        return geminidataanalytics.DataChatServiceClient()
+    return geminidataanalytics.DataChatServiceClient(credentials=credentials)
 
 
 def create_conversation(credentials=None, agent_id: str | None = None, location: str | None = None) -> str:
@@ -126,19 +115,18 @@ def chat(question: str, conversation_name: str | None = None,
          agent_id: str | None = None,
          location: str | None = None) -> ChatResult:
     """
-    Send a question to the BQCA agent via the Conversational Analytics API with gRPC Channel reuse and session pre-warming.
+    Send a question to the BQCA agent via the Conversational Analytics API.
+    If conversation_name is None, a new conversation is created (single-turn).
+    If target_service_account is provided, impersonate it for the call.
+    If agent_id or location is provided, route the call to the specified BQCA data agent and GCP region.
+    Returns a ChatResult with summary, SQL, data rows, and optional chart.
     """
     credentials = _get_credentials(target_service_account)
-    chat_client = _get_client(credentials, target_sa=target_service_account)
 
-    # 1. 0ms Session allocation from Pre-warmed Pool if not provided
+    chat_client = _get_client(credentials)
+
     if conversation_name is None:
-        from app.bqca.pool import conversation_pool
-        try:
-            loop = asyncio.get_running_loop()
-            conversation_name = loop.run_until_complete(conversation_pool.get_session(agent_id=agent_id, location=location, credentials=credentials))
-        except Exception:
-            conversation_name = create_conversation(credentials, agent_id=agent_id, location=location)
+        conversation_name = create_conversation(credentials, agent_id=agent_id, location=location)
 
     user_msg = geminidataanalytics.Message(user_message={"text": question})
     convo_ref = geminidataanalytics.ConversationReference()
@@ -156,21 +144,7 @@ def chat(question: str, conversation_name: str | None = None,
     final_text_messages: list[str] = []
     legacy_text_messages: list[str] = []
 
-    try:
-        messages_stream = chat_client.chat(request=req)
-    except Exception as err:
-        # Auto-healing: If conversation expired or NOT_FOUND, fallback to fresh conversation
-        if "NOT_FOUND" in str(err) or "does not exist" in str(err):
-            logger.warning("Conversation %s expired or NOT_FOUND, auto-healing with fresh session...", conversation_name)
-            fresh_convo = create_conversation(credentials, agent_id=agent_id, location=location)
-            convo_ref.conversation = fresh_convo
-            req.conversation_reference = convo_ref
-            result.conversation_name = fresh_convo
-            messages_stream = chat_client.chat(request=req)
-        else:
-            raise err
-
-    for message in messages_stream:
+    for message in chat_client.chat(request=req):
         sm_dict = MessageToDict(message.system_message._pb)
 
         if "text" in sm_dict:
@@ -246,99 +220,3 @@ def extract_html_from_summary(summary: str) -> tuple[str | None, str]:
         clean_summary = pattern.sub("", summary).strip()
         return html_code, clean_summary
     return None, summary
-
-
-async def chat_stream(
-    question: str,
-    conversation_name: str | None = None,
-    target_service_account: str | None = None,
-    agent_id: str | None = None,
-    location: str | None = None,
-):
-    """
-    Async generator streaming BQCA chunks.
-    Pops a pre-warmed conversation session in 0ms from conversation_pool if conversation_name is None!
-    """
-    credentials = _get_credentials(target_service_account)
-
-    if conversation_name is None:
-        conversation_name = await conversation_pool.get_session(agent_id=agent_id, location=location, credentials=credentials)
-
-    queue: asyncio.Queue[tuple[ChatResult, bool]] = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-
-    def _sync_worker():
-        chat_client = _get_client(credentials)
-        user_msg = geminidataanalytics.Message(user_message={"text": question})
-        convo_ref = geminidataanalytics.ConversationReference()
-        convo_ref.conversation = conversation_name
-        convo_ref.data_agent_context.data_agent = _agent_path(agent_id, location)
-
-        req = geminidataanalytics.ChatRequest(
-            parent=_parent_path(location),
-            messages=[user_msg],
-            conversation_reference=convo_ref,
-        )
-
-        result = ChatResult()
-        result.conversation_name = conversation_name
-        final_text_messages: list[str] = []
-        legacy_text_messages: list[str] = []
-
-        try:
-            for message in chat_client.chat(request=req):
-                sm_dict = MessageToDict(message.system_message._pb)
-
-                if "text" in sm_dict:
-                    text_obj = sm_dict["text"]
-                    text_type = text_obj.get("textType", "")
-                    parts = text_obj.get("parts", [])
-
-                    if text_type == "THOUGHT":
-                        for part in parts:
-                            cleaned_thought = part.strip()
-                            if cleaned_thought and cleaned_thought not in result.thinking_process:
-                                result.thinking_process.append(cleaned_thought)
-                    elif text_type == "FINAL_RESPONSE":
-                        final_text = "".join(parts).strip()
-                        if final_text:
-                            final_text_messages.append(final_text)
-                    elif text_type in ("", "TEXT_TYPE_UNSPECIFIED"):
-                        visible_parts = [part for part in parts if not _is_noise(part)]
-                        final_text = "".join(visible_parts).strip()
-                        if final_text:
-                            legacy_text_messages.append(final_text)
-
-                if "data" in sm_dict:
-                    data = sm_dict["data"]
-                    if "generatedSql" in data:
-                        result.sql = data["generatedSql"]
-                    if "result" in data:
-                        r = data["result"]
-                        result.fields = [f["name"] for f in r.get("schema", {}).get("fields", [])]
-                        result.rows = r.get("data", [])
-
-                if "chart" in sm_dict:
-                    chart = sm_dict["chart"]
-                    if "result" in chart:
-                        result.vega_config = chart["result"].get("vegaConfig")
-
-                if final_text_messages:
-                    result.summary = "\n".join(final_text_messages)
-                elif legacy_text_messages:
-                    result.summary = "\n".join(legacy_text_messages)
-
-                asyncio.run_coroutine_threadsafe(queue.put((result, False)), loop)
-
-        except Exception as e:
-            logger.error("Error in sync_worker chat_stream: %s", e, exc_info=True)
-        finally:
-            asyncio.run_coroutine_threadsafe(queue.put((result, True)), loop)
-
-    asyncio.to_thread(_sync_worker)
-
-    while True:
-        res, is_complete = await queue.get()
-        yield res, is_complete
-        if is_complete:
-            break

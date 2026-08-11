@@ -360,11 +360,3 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
             await adapter.send_text_message(chat_id, "查询处理失败，请稍后再试或换种说法。", app_id=app_id)
         except Exception:
             pass
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Start BQCA ConversationPoolFactory async pre-warming on service startup."""
-    from app.bqca.pool import conversation_pool
-    logger.info("Initializing BQCA ConversationPoolFactory pre-warming on service startup...")
-    conversation_pool.start_prewarming()
