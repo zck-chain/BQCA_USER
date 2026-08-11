@@ -323,19 +323,25 @@ class _ThrottledSummaryPatch:
             self._stage = stage
 
     async def _flush(self) -> None:
-        await asyncio.sleep(self._interval)
-        self._task = None
+        # Keep self._task pointing at this task for the whole sleep+PATCH so a
+        # schedule() landing inside the throttle window sees it as in-flight and
+        # coalesces instead of spawning a second concurrent PATCH. Reset only on
+        # exit (normal completion or cancel()).
         try:
-            await self._adapter.patch_partial_summary(
-                self._message_id,
-                self._question,
-                self._thoughts,
-                self._partial_summary,
-                self._stage,
-                app_id=self._app_id,
-            )
-        except Exception as e:
-            logger.warning("Throttled partial summary PATCH failed: %s", e)
+            await asyncio.sleep(self._interval)
+            try:
+                await self._adapter.patch_partial_summary(
+                    self._message_id,
+                    self._question,
+                    self._thoughts,
+                    self._partial_summary,
+                    self._stage,
+                    app_id=self._app_id,
+                )
+            except Exception as e:
+                logger.warning("Throttled partial summary PATCH failed: %s", e)
+        finally:
+            self._task = None
 
     def schedule(self) -> None:
         """Schedule a trailing-edge flush; coalesces repeated calls within the window."""

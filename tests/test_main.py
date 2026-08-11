@@ -542,3 +542,49 @@ async def test_streaming_loop_cancels_trailing_summary_patch_before_final():
     # No trailing partial PATCH ever fired (it was cancelled before its 0.8s delay).
     adapter.patch_partial_summary.assert_not_awaited()
     adapter.patch_final_card.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_throttled_summary_patch_coalesces_bursts():
+    """Two schedule() calls inside one throttle window must fire exactly one PATCH.
+
+    Regression guard: _task must remain set across the await sleep so the second
+    schedule() sees an in-flight flush and coalesces instead of spawning a second
+    concurrent PATCH (which defeats the throttle and can hit Feishu rate limits).
+    """
+    from app.main import _ThrottledSummaryPatch
+
+    adapter = MagicMock()
+    adapter.patch_partial_summary = AsyncMock(return_value=True)
+    throttler = _ThrottledSummaryPatch(
+        adapter, "om_msg", "问题", app_id=None, interval=0.1,
+    )
+
+    throttler.update(partial_summary="第一段")
+    throttler.schedule()
+    await asyncio.sleep(0.03)
+    throttler.update(partial_summary="第一段\n第二段")
+    throttler.schedule()  # must coalesce, not spawn a second flush
+    await asyncio.sleep(0.25)
+
+    assert adapter.patch_partial_summary.await_count == 1
+    # The single trailing flush carries the latest accumulated text.
+    assert adapter.patch_partial_summary.await_args.args[3] == "第一段\n第二段"
+
+
+@pytest.mark.asyncio
+async def test_throttled_summary_patch_cancel_skips_patch():
+    from app.main import _ThrottledSummaryPatch
+
+    adapter = MagicMock()
+    adapter.patch_partial_summary = AsyncMock(return_value=True)
+    throttler = _ThrottledSummaryPatch(
+        adapter, "om_msg", "问题", app_id=None, interval=0.3,
+    )
+    throttler.update(partial_summary="部分")
+    throttler.schedule()
+    await asyncio.sleep(0.05)
+    throttler.cancel()
+    await asyncio.sleep(0.4)
+
+    adapter.patch_partial_summary.assert_not_awaited()
