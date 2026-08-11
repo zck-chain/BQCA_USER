@@ -1,7 +1,11 @@
 # BQCA 项目会话全量总结报告 (Session Summary)
 
-> **最近更新时间**：2026-07-30 14:55:00 (Asia/Shanghai)  
-> **状态**：双飞书机器人 + 全球区 (Global) 双 BQCA Agent 架构 + Vega 图表原生 PNG 极速渲染（思源黑体 CJK 中文字库补齐）+ 云端 2核满血 CPU 算力（`--no-cpu-throttling`）全量部署上线，所有单元测试 100% 通过。
+> **最近更新时间**：2026-08-11 10:35:00 (Asia/Shanghai)  
+> **云端部署状态**：Google Cloud Run 服务 `bqca-bot` 最新 Revision `bqca-bot-00075-rrl` 已 100% 满血上线！  
+> **服务 URL**：`https://bqca-bot-839062387451.asia-east1.run.app`  
+> **项目 Git 分支状态**：
+> - **`main` 分支**（生产主干）：`origin/main` 保持干净安全状态。
+> - **`feature/session-pool` 分支**：已将 `ConversationPoolFactory` 预热对象池代码安全备份至 GitHub 独立分支。
 
 ---
 
@@ -11,13 +15,10 @@
 
 在 2026-07-30 的深度迭代中，完成了以下突破性技术升级与细节优化：
 
-1. **Vega-Lite 折线图/柱状图/饼图原生渲染与飞书卡片无缝内嵌 (方案 A)**：
-   * 集成 Rust-based 高性能渲染引擎 `vl-convert-python`，在 **<10 毫秒** 内将 BQCA 返回的 `vega_config` JSON Spec 转化为高清 PNG 字节流。
-   * 调取飞书开放平台 `POST /open-apis/im/v1/images` 接口上传图片，拿到 `image_key` 并将 `img` 图像组件直接打入飞书 Lark Card v2 交互卡片正中央。
-
-2. **Linux 容器 CJK 中文字体库补齐（彻底消除乱码方块 `□`）**：
-   * 在 [Dockerfile](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/Dockerfile) 中集成了 **Google 思源黑体 (`fonts-noto-cjk`)** 与 **文泉驿正黑 (`fonts-wqy-zenhei`)** 矢量字库。
-   * 彻底修复了 Linux 容器无中文字体导致的折线图/饼图标题与坐标轴 `□□□` 豆腐块乱码问题，呈现高清规范的中文字体排版。
+<<<<<<< Updated upstream
+1. **`AsyncGenerator` 实时 `yield Event` + 飞书自然积木式追加 PATCH 卡片**：
+   * 在 [`app/bqca/client.py`](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/app/bqca/client.py) 中实现 `chat_stream_events` 实时事件生成器。
+   * 在 [`app/main.py`](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/app/main.py) 与 [`app/feishu/message.py`](file:///Users/apple/Desktop/工作/产品演示/BQCA+KC/BQCA_user/app/feishu/message.py) 中实现自然积木式追加：完全顺应 BQCA 数据吐出的物理先后顺序，产生什么就向卡片底部平滑追加什么！
 
 3. **飞书开放平台应用身份权限 (`im:resource`) 排查与授权开启**：
    * 通过实时后台日志抓取并定位飞书 API `99991672: Access denied` 权限报错，协助用户在飞书开发者后台开启并发布了**游戏机器人与电商机器人的 `im:resource`（应用身份）图片上传权限**，实测返回 `code: 0` 成功上图。

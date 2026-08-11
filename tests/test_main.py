@@ -1,12 +1,39 @@
+import asyncio
 import time
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from fastapi.testclient import TestClient
 from app.main import BQCAAgentConfig, _process_query, app
+from app.bqca.client import BQCAEvent, BQCAEventType
 from app.storage import sqlite as sqlite_storage
 
 client = TestClient(app)
+
+
+def _final_stream(result):
+    """Return an async function usable as a chat_stream_events replacement yielding one FINAL event."""
+    async def _gen(*args, **kwargs):
+        yield BQCAEvent(event_type=BQCAEventType.FINAL, data=getattr(result, "summary", ""), result=result)
+    return _gen
+
+
+def _stream_chain(results):
+    """Return an async function whose successive calls each yield one FINAL for the given results."""
+    it = iter(results)
+
+    async def _gen(*args, **kwargs):
+        result = next(it)
+        yield BQCAEvent(event_type=BQCAEventType.FINAL, data=getattr(result, "summary", ""), result=result)
+    return _gen
+
+
+def _stream_with_events(events):
+    """Return an async chat_stream_events replacement yielding the given BQCAEvents then a FINAL."""
+    async def _gen(*args, **kwargs):
+        for e in events:
+            yield e
+    return _gen
 
 
 @pytest.fixture(autouse=True)
@@ -272,6 +299,7 @@ async def test_game_query_uses_game_fallback_questions():
     )
     adapter = MagicMock()
     adapter.send_text_message = AsyncMock()
+    adapter.send_initial_card = AsyncMock(return_value=None)
     adapter.send_result_card = AsyncMock()
     adapter.format_summary.return_value = ""
 
@@ -282,7 +310,7 @@ async def test_game_query_uses_game_fallback_questions():
              display_name="Flood-It! 游戏数据洞察专家",
              domain="game",
          )), \
-         patch("app.main.chat", return_value=result), \
+         patch("app.bqca.client.chat_stream_events", side_effect=_final_stream(result)), \
          patch("app.main._get_conversation", return_value=None), \
          patch("app.main._save_conversation"):
         await _process_query("分析玩家数据", "ou_test", app_id="game-app")
@@ -319,15 +347,100 @@ async def test_webhook_conversation_is_scoped_by_domain():
     )
     adapter = MagicMock()
     adapter.send_text_message = AsyncMock()
+    adapter.send_initial_card = AsyncMock(return_value=None)
     adapter.send_result_card = AsyncMock()
     adapter.format_summary.return_value = ""
 
     with patch("app.main.get_card_adapter", return_value=adapter), \
          patch("app.main.settings.GAME_FEISHU_APP_ID", "game-app"), \
-         patch("app.main.chat", side_effect=[ecommerce_result, game_result]) as mock_chat, \
+         patch("app.bqca.client.chat_stream_events",
+               side_effect=_stream_chain([ecommerce_result, game_result])) as mock_stream, \
          patch("app.main.upload_html", new_callable=AsyncMock):
         await _process_query("商品状态分布", "oc_same_chat")
         await _process_query("玩家活跃度", "oc_same_chat", app_id="game-app")
 
-    assert mock_chat.call_args_list[0].args == ("商品状态分布", None)
-    assert mock_chat.call_args_list[1].args == ("玩家活跃度", None)
+    assert mock_stream.call_args_list[0].args == ("商品状态分布",)
+    assert mock_stream.call_args_list[0].kwargs["conversation_name"] is None
+    assert mock_stream.call_args_list[1].args == ("玩家活跃度",)
+    assert mock_stream.call_args_list[1].kwargs["conversation_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_streaming_loop_patches_thoughts_summary_and_final():
+    result = MagicMock(
+        summary="完整洞察",
+        sql="SELECT 1",
+        fields=["a"],
+        rows=[{"a": 1}],
+        vega_config=None,
+        conversation_name="conversations/stream-1",
+        recommended_questions=[],
+        thinking_process=[],
+    )
+
+    async def _gen(*args, **kwargs):
+        yield BQCAEvent(BQCAEventType.THOUGHT, data=["正在分析"], result=result)
+        yield BQCAEvent(BQCAEventType.SUMMARY, data="第一段", result=result)
+        # Wait beyond the 0.8s throttle so the trailing SUMMARY PATCH fires.
+        await asyncio.sleep(0.9)
+        yield BQCAEvent(BQCAEventType.SUMMARY, data="第一段\n第二段", result=result)
+        await asyncio.sleep(0.9)
+        yield BQCAEvent(BQCAEventType.FINAL, data="完整洞察", result=result)
+
+    adapter = MagicMock()
+    adapter.send_text_message = AsyncMock()
+    adapter.send_initial_card = AsyncMock(return_value="om_msg")
+    adapter.patch_partial_summary = AsyncMock(return_value=True)
+    adapter.patch_final_card = AsyncMock(return_value=True)
+    adapter.format_summary.return_value = "完整洞察"
+
+    with patch("app.main.get_card_adapter", return_value=adapter), \
+         patch("app.bqca.client.chat_stream_events", side_effect=_gen), \
+         patch("app.main._get_conversation", return_value=None), \
+         patch("app.main._save_conversation"), \
+         patch("app.main.upload_html", new_callable=AsyncMock):
+        await _process_query("分析数据", "oc_test")
+
+    # THOUGHT produced an immediate PATCH; SUMMARY produced trailing-edge PATCHes.
+    assert adapter.patch_partial_summary.await_count >= 2
+    first = adapter.patch_partial_summary.await_args_list[0]
+    # signature: (message_id, question, thoughts, partial_summary, stage, app_id=...)
+    assert first.args[2] == ["正在分析"]
+    # Final card landed and was not clobbered by a stale trailing PATCH
+    # (final is the last card-mutating await).
+    adapter.patch_final_card.assert_awaited_once()
+    assert adapter.patch_final_card.await_args.kwargs["summary"] == "完整洞察"
+
+
+@pytest.mark.asyncio
+async def test_streaming_loop_cancels_trailing_summary_patch_before_final():
+    """A SUMMARY right before FINAL must not PATCH after the final card lands."""
+    result = MagicMock(
+        summary="最终",
+        sql="", fields=[], rows=[], vega_config=None,
+        conversation_name="conversations/c-1",
+        recommended_questions=[], thinking_process=[],
+    )
+
+    async def _gen(*args, **kwargs):
+        # SUMMARY scheduled but no sleep — its trailing 0.8s PATCH must be cancelled by FINAL.
+        yield BQCAEvent(BQCAEventType.SUMMARY, data="部分", result=result)
+        yield BQCAEvent(BQCAEventType.FINAL, data="最终", result=result)
+
+    adapter = MagicMock()
+    adapter.send_text_message = AsyncMock()
+    adapter.send_initial_card = AsyncMock(return_value="om_msg")
+    adapter.patch_partial_summary = AsyncMock(return_value=True)
+    adapter.patch_final_card = AsyncMock(return_value=True)
+    adapter.format_summary.return_value = "最终"
+
+    with patch("app.main.get_card_adapter", return_value=adapter), \
+         patch("app.bqca.client.chat_stream_events", side_effect=_gen), \
+         patch("app.main._get_conversation", return_value=None), \
+         patch("app.main._save_conversation"), \
+         patch("app.main.upload_html", new_callable=AsyncMock):
+        await _process_query("分析数据", "oc_test")
+
+    # No trailing partial PATCH ever fired (it was cancelled before its 0.8s delay).
+    adapter.patch_partial_summary.assert_not_awaited()
+    adapter.patch_final_card.assert_awaited_once()

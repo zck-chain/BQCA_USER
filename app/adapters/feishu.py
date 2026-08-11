@@ -307,3 +307,66 @@ class FeishuAdapter(BaseCardAdapter):
             result_url=result_url,
             app_id=app_id,
         )
+
+    async def send_initial_card(self, target_id: str, question: str, app_id: str | None = None) -> str | None:
+        """Send stage 1 initial loading card and return message_id."""
+        from app.feishu.message import send_initial_loading_card
+        return await send_initial_loading_card(target_id, question, app_id=app_id)
+
+    async def patch_progress_card(self, message_id: str, question: str, status_text: str, sql: str | None = None, app_id: str | None = None) -> bool:
+        """Stage 2 in-place PATCH update."""
+        from app.feishu.message import patch_progress_card
+        return await patch_progress_card(message_id, question, status_text, sql=sql, app_id=app_id)
+
+    async def patch_partial_summary(
+        self,
+        message_id: str,
+        question: str,
+        thoughts: list[str] | None,
+        partial_summary: str,
+        stage: str,
+        app_id: str | None = None,
+    ) -> bool:
+        """Streaming PATCH with collapsible thought chain and progressively arriving insight text."""
+        from app.feishu.message import patch_partial_summary as _patch
+        return await _patch(
+            message_id=message_id,
+            question=question,
+            thoughts=thoughts,
+            partial_summary=partial_summary,
+            stage=stage,
+            app_id=app_id,
+        )
+
+    async def patch_final_card(
+        self,
+        message_id: str,
+        question: str,
+        summary: str,
+        sql: str | None = None,
+        fields: list[str] | None = None,
+        rows: list[dict] | None = None,
+        recommended_questions: list[str] | None = None,
+        result_url: str | None = None,
+        vega_config: dict | None = None,
+        app_id: str | None = None,
+    ) -> bool:
+        """Stage 3 in-place PATCH final result card."""
+        from app.feishu.message import patch_final_result_card
+        class MockResult:
+            def __init__(self):
+                self.sql = sql or ""
+                self.fields = fields or []
+                self.rows = rows or []
+                self.recommended_questions = recommended_questions or []
+                self.vega_config = vega_config
+
+        res = MockResult()
+        return await patch_final_result_card(
+            message_id=message_id,
+            question=question,
+            result=res,
+            cleaned_summary=summary,
+            result_url=result_url,
+            app_id=app_id,
+        )

@@ -24,3 +24,11 @@ BQCA_Select_Sql.zip
 # Temporary / diagnostic files
 scratch/
 
+#claude
+.multica/
+.claude/
+claude.md
+CLAUDE.md
+description.md
+issue_context.md
+.agent_context/

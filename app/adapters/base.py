@@ -33,3 +33,16 @@ class BaseCardAdapter(ABC):
     ) -> dict:
         """Send rich interactive card with formatted summary, SQL, data table, and follow-ups."""
         pass
+
+    @abstractmethod
+    async def patch_partial_summary(
+        self,
+        message_id: str,
+        question: str,
+        thoughts: list[str] | None,
+        partial_summary: str,
+        stage: str,
+        app_id: str | None = None,
+    ) -> bool:
+        """Streaming in-place PATCH: collapsible thought chain + progressively arriving insight text."""
+        pass

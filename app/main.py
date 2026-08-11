@@ -44,6 +44,11 @@ logger = logging.getLogger(__name__)
 SESSION_TTL = 86400 * 30  # 30 days
 FEISHU_EVENT_MAX_AGE_SECONDS = 600  # Demo guard against delayed callback retries
 
+# Throttle interval for streaming insight PATCHes (Feishu rate-limits whole-card PATCH).
+# SUMMARY events are block-level and can arrive in bursts; ~800ms coalesces them while
+# still feeling near-real-time. The last pending flush always fires (trailing edge).
+SUMMARY_PATCH_THROTTLE_SECONDS = 0.8
+
 DEMO_ROLES = {"运营经理", "一线客服"}
 ROLE_ALIASES = {
     "经理": "运营经理",
@@ -280,39 +285,156 @@ async def webhook_event(request: Request):
     return {"status": "ok"}
 
 
+class _ThrottledSummaryPatch:
+    """Coalescing trailing-edge throttle for streaming partial-summary PATCH calls.
+
+    Feishu rate-limits whole-card PATCH. SUMMARY events are block-level and can arrive
+    in bursts; this ensures at most one in-flight PATCH per throttle window while always
+    flushing the latest accumulated text on the trailing edge.
+    """
+
+    def __init__(self, adapter, message_id: str, question: str, app_id: str | None,
+                 interval: float = SUMMARY_PATCH_THROTTLE_SECONDS):
+        self._adapter = adapter
+        self._message_id = message_id
+        self._question = question
+        self._app_id = app_id
+        self._interval = interval
+        self._thoughts: list[str] = []
+        self._partial_summary: str = ""
+        self._stage: str = ""
+        self._task: asyncio.Task | None = None
+
+    def update(self, *, thoughts: list[str] | None = None, partial_summary: str | None = None,
+               stage: str | None = None) -> None:
+        if thoughts is not None:
+            self._thoughts = thoughts
+        if partial_summary is not None:
+            self._partial_summary = partial_summary
+        if stage is not None:
+            self._stage = stage
+
+    async def _flush(self) -> None:
+        await asyncio.sleep(self._interval)
+        self._task = None
+        try:
+            await self._adapter.patch_partial_summary(
+                self._message_id,
+                self._question,
+                self._thoughts,
+                self._partial_summary,
+                self._stage,
+                app_id=self._app_id,
+            )
+        except Exception as e:
+            logger.warning("Throttled partial summary PATCH failed: %s", e)
+
+    def schedule(self) -> None:
+        """Schedule a trailing-edge flush; coalesces repeated calls within the window."""
+        if self._task is None:
+            self._task = asyncio.create_task(self._flush())
+
+    async def flush_now(self) -> None:
+        """Cancel any pending trailing flush and PATCH the latest state immediately."""
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        try:
+            await self._adapter.patch_partial_summary(
+                self._message_id,
+                self._question,
+                self._thoughts,
+                self._partial_summary,
+                self._stage,
+                app_id=self._app_id,
+            )
+        except Exception as e:
+            logger.warning("Immediate partial summary PATCH failed: %s", e)
+
+    def cancel(self) -> None:
+        """Drop any pending trailing flush without PATCHing (used before final card)."""
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+
 async def _process_query(question: str, chat_id: str, platform: str = "feishu", app_id: str | None = None):
-    """Query BQCA and reply using platform Card Adapter (Feishu, DingTalk, WeCom, etc.)."""
+    """Query BQCA with real-time stream events and 3-stage in-place PATCH card updates."""
     adapter = get_card_adapter(platform)
     agent_cfg = get_agent_config(app_id=app_id)
     try:
-        await adapter.send_text_message(chat_id, "正在查询，请稍候...", app_id=app_id)
+        # Stage 1: Send initial loading card in 0.5s and get message_id for in-place PATCH
+        message_id = await adapter.send_initial_card(chat_id, question, app_id=app_id)
 
         session_key = _scoped_conversation_key(chat_id, agent_cfg.domain)
         conversation_name = _get_conversation(session_key)
-        result = await asyncio.to_thread(
-            chat,
+
+        from app.bqca.client import chat_stream_events, BQCAEventType
+
+        final_result = None
+        sql_updated = False
+        data_updated = False
+
+        async for event in chat_stream_events(
             question,
-            conversation_name,
+            conversation_name=conversation_name,
             agent_id=agent_cfg.agent_id,
             location=agent_cfg.location,
-        )
+        ):
+            if event.result and event.result.conversation_name:
+                _save_conversation(session_key, event.result.conversation_name)
 
-        # Save conversation for follow-up questions
+            if event.event_type == BQCAEventType.SQL and not sql_updated and message_id:
+                sql_updated = True
+                await adapter.patch_progress_card(
+                    message_id,
+                    question,
+                    "⚡ 已生成 BigQuery SQL，正在查询数据库...",
+                    sql=event.data,
+                    app_id=app_id,
+                )
+
+            elif event.event_type == BQCAEventType.DATA and not data_updated and message_id:
+                data_updated = True
+                row_count = len(event.data) if isinstance(event.data, list) else 0
+                await adapter.patch_progress_card(
+                    message_id,
+                    question,
+                    f"📊 数据库查询成功（已获取 {row_count} 行数据），正在生成商业洞察与图表...",
+                    sql=event.result.sql if event.result else None,
+                    app_id=app_id,
+                )
+
+            elif event.event_type == BQCAEventType.FINAL:
+                final_result = event.result
+
+        if not final_result:
+            logger.error("No final BQCA result returned for question: %s", question)
+            if message_id:
+                await adapter.patch_progress_card(
+                    message_id,
+                    question,
+                    "⚠️ 查询处理超时或服务繁忙，请稍后再试或换种说法。",
+                    app_id=app_id,
+                )
+            return
+
+        result = final_result
+
+        # Save final conversation name
         _save_conversation(session_key, result.conversation_name)
 
-        logger.info("BQCA result: %d rows, sql=%s, chart=%s, convo=%s",
+        logger.info("BQCA final result: %d rows, sql=%s, chart=%s, convo=%s",
                      len(result.rows), bool(result.sql), bool(result.vega_config),
                      result.conversation_name[-20:] if result.conversation_name else "none")
 
-        # Split BQCA text into English thinking lines and Chinese summary (Bypassed if using new structured Map-keys)
         if "LOGIC_EXPLANATION" in result.summary or "BUSINESS_INSIGHTS" in result.summary:
             summary = result.summary
         else:
-            thoughts, summary = extract_thoughts_and_summary(result.summary)
-            if thoughts:
-                result.thinking_process.extend(thoughts)
+            extra_thoughts, summary = extract_thoughts_and_summary(result.summary)
+            if extra_thoughts:
+                result.thinking_process.extend(extra_thoughts)
 
-        # Fallback recommended questions if BQCA returned empty
         if not result.recommended_questions:
             if agent_cfg.domain == "game":
                 result.recommended_questions = [
@@ -327,7 +449,6 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
                     "查询退货数最高的前 5 类商品",
                 ]
 
-        # Extract native BQCA HTML code block if present and upload to GCS
         html_code, clean_summary = extract_html_from_summary(summary)
         result_url = None
         if html_code:
@@ -338,21 +459,35 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
             except Exception as gcs_err:
                 logger.warning("Failed to upload HTML report to GCS: %s", gcs_err)
 
-        # Format summary via Card Adapter
         formatted_summary = adapter.format_summary(clean_summary)
 
-        await adapter.send_result_card(
-            target_id=chat_id,
-            question=question,
-            summary=formatted_summary or ("未查询到相关数据，请换个说法试试。" if not result.rows and not result.vega_config else "查询完成。"),
-            sql=result.sql,
-            fields=result.fields,
-            rows=result.rows,
-            recommended_questions=result.recommended_questions,
-            result_url=result_url,
-            vega_config=result.vega_config,
-            app_id=app_id,
-        )
+        # Stage 3: In-place PATCH final result card with VChart and Action Buttons
+        if message_id:
+            await adapter.patch_final_card(
+                message_id=message_id,
+                question=question,
+                summary=formatted_summary or ("未查询到相关数据，请换个说法试试。" if not result.rows and not result.vega_config else "查询完成。"),
+                sql=result.sql,
+                fields=result.fields,
+                rows=result.rows,
+                recommended_questions=result.recommended_questions,
+                result_url=result_url,
+                vega_config=result.vega_config,
+                app_id=app_id,
+            )
+        else:
+            await adapter.send_result_card(
+                target_id=chat_id,
+                question=question,
+                summary=formatted_summary or ("未查询到相关数据，请换个说法试试。" if not result.rows and not result.vega_config else "查询完成。"),
+                sql=result.sql,
+                fields=result.fields,
+                rows=result.rows,
+                recommended_questions=result.recommended_questions,
+                result_url=result_url,
+                vega_config=result.vega_config,
+                app_id=app_id,
+            )
 
     except Exception as e:
         logger.error("Query processing failed: %s", e, exc_info=True)

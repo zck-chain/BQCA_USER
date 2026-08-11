@@ -664,21 +664,26 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
 
     # 6. Interactive Actions / Recommended Questions Block (Temporarily Commented Out)
     # if result.recommended_questions:
-    #     elements.append({
-    #         "tag": "markdown",
-    #         "content": "**🚀 快捷追问深度分析：**"
-    #     })
+    #     button_actions = []
     #     for q in result.recommended_questions[:3]:
-    #         display_title = q[:18] + "..." if len(q) > 18 else q
-    #         elements.append({
+    #         display_title = q[:20] + "..." if len(q) > 20 else q
+    #         button_actions.append({
     #             "tag": "button",
-    #             "text": {"tag": "plain_text", "content": f"💬 {display_title}"},
-    #             "type": "default",
+    #             "text": {"tag": "plain_text", "content": f"🔘 {display_title}"},
+    #             "type": "primary",
     #             "value": {
     #                 "action": "quick_query",
     #                 "query": q
     #             }
     #         })
+    #     elements.append({
+    #         "tag": "markdown",
+    #         "content": "**💡 猜您想问（点击直接发起下一轮分析）：**"
+    #     })
+    #     elements.append({
+    #         "tag": "action",
+    #         "actions": button_actions
+    #     })
 
     # Create Lark Card Schema 2.0 Content
     card_content = {
@@ -718,6 +723,268 @@ async def send_premium_result_card(chat_id: str, question: str, result, cleaned_
         resp_json = resp.json()
         if resp.status_code != 200 or resp_json.get("code") != 0:
             logger.error("Feishu API error! Status: %d, Response: %s", resp.status_code, json.dumps(resp_json, ensure_ascii=False))
+            return None
         else:
-            logger.info("Feishu premium interactive card sent successfully.")
-        return resp_json
+            message_id = resp_json.get("data", {}).get("message_id")
+            logger.info("Feishu premium interactive card sent successfully (message_id=%s).", message_id)
+            return message_id
+
+
+async def send_initial_loading_card(chat_id: str, question: str, app_id: str | None = None) -> str | None:
+    """Stage 1: Send initial card with question and light status line."""
+    token = await _get_tenant_token(app_id=app_id)
+    card_content = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "template": "indigo",
+            "title": {"tag": "plain_text", "content": "📊 BQCA 智能数据分析"}
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"**🔍 提问问题：**\n{question}"
+                },
+                {
+                    "tag": "markdown",
+                    "content": "🔄 *正在理解业务意图并自动生成 BigQuery SQL 查询语句...*"
+                }
+            ]
+        }
+    }
+
+    receive_id_type = "open_id" if chat_id.startswith("ou_") else "chat_id"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            "https://open.feishu.cn/open-apis/im/v1/messages",
+            params={"receive_id_type": receive_id_type},
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card_content),
+            },
+        )
+        resp_json = resp.json()
+        if resp.status_code == 200 and resp_json.get("code") == 0:
+            message_id = resp_json.get("data", {}).get("message_id")
+            logger.info("Stage 1 initial card sent successfully (message_id=%s).", message_id)
+            return message_id
+        logger.error("Failed to send initial card: %s", resp_json)
+        return None
+
+
+async def patch_progress_card(message_id: str, question: str, status_text: str, sql: str | None = None, app_id: str | None = None) -> bool:
+    """Stage 2: In-place PATCH update prepending generated SQL block and appending status line."""
+    if not message_id:
+        return False
+    token = await _get_tenant_token(app_id=app_id)
+    
+    elements = [
+        {
+            "tag": "markdown",
+            "content": f"**🔍 提问问题：**\n{question}"
+        }
+    ]
+
+    if sql:
+        elements.append({
+            "tag": "collapsible_panel",
+            "expanded": True,
+            "header": {
+                "title": {"tag": "plain_text", "content": "💻 已生成 BigQuery SQL 查询语句"}
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"```sql\n{sql}\n```"
+                }
+            ]
+        })
+
+    elements.append({
+        "tag": "markdown",
+        "content": f"🔄 *{status_text}*"
+    })
+
+    card_content = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "enable_forward": True},
+        "header": {
+            "template": "indigo",
+            "title": {"tag": "plain_text", "content": "📊 BQCA 智能数据分析"}
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": elements
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.patch(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "content": json.dumps(card_content),
+            },
+        )
+        resp_json = resp.json()
+        if resp.status_code == 200 and resp_json.get("code") == 0:
+            logger.info("Stage 2 progressive card PATCH updated successfully (message_id=%s).", message_id)
+            return True
+        logger.error("Failed to PATCH progress card message_id %s: %s", message_id, resp_json)
+        return False
+
+
+
+
+
+async def patch_final_result_card(message_id: str, question: str, result, cleaned_summary: str, result_url: str | None = None, app_id: str | None = None) -> bool:
+    """Stage 3 in-place PATCH card update to render final report with VChart and Action Buttons."""
+    if not message_id:
+        return False
+    token = await _get_tenant_token(app_id=app_id)
+
+    elements = []
+
+    # 1. Natural Language Question
+    elements.append({
+        "tag": "markdown",
+        "content": f"**🔍 提问问题：**\n{question}"
+    })
+
+    # 2. Collapsible SQL
+    if result.sql:
+        elements.append({
+            "tag": "collapsible_panel",
+            "expanded": False,
+            "header": {
+                "title": {"tag": "plain_text", "content": "💻 查看自动生成的 SQL 语句"}
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"```sql\n{result.sql}\n```"
+                }
+            ]
+        })
+
+    # 3. Dynamic Data Table Block
+    if result.rows and result.fields:
+        main_rows = result.rows[:10]
+        remaining_rows = result.rows[10:]
+
+        table_md = "| " + " | ".join(result.fields) + " |\n"
+        table_md += "| " + " | ".join(["---"] * len(result.fields)) + " |\n"
+        for row in main_rows:
+            table_md += "| " + " | ".join(str(row.get(f, "-")) for f in result.fields) + " |\n"
+
+        elements.append({
+            "tag": "markdown",
+            "content": f"**📊 数据查询结果展示：**\n\n{table_md}"
+        })
+
+        if remaining_rows:
+            rem_table_md = "| " + " | ".join(result.fields) + " |\n"
+            rem_table_md += "| " + " | ".join(["---"] * len(result.fields)) + " |\n"
+            for row in remaining_rows[:30]:
+                rem_table_md += "| " + " | ".join(str(row.get(f, "-")) for f in result.fields) + " |\n"
+            
+            rem_count = len(remaining_rows)
+            if rem_count > 30:
+                rem_table_md += f"\n*⚠️ 仅展示前 30 行余量数据。*"
+
+            elements.append({
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {"tag": "plain_text", "content": f"🔽 展开查看其余 {rem_count} 行数据"}
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": rem_table_md
+                    }
+                ]
+            })
+
+    # 4. Render VChart Component
+    vega_cfg = getattr(result, "vega_config", None)
+    if vega_cfg:
+        sql_str = getattr(result, "sql", None)
+        vega_cfg = translate_spec_fields(vega_cfg, sql=sql_str)
+        vchart_spec = vega_to_vchart(vega_cfg, sql=sql_str)
+        if vchart_spec:
+            elements.append({
+                "tag": "markdown",
+                "content": "**📈 可视化数据图表：**"
+            })
+            elements.append({
+                "tag": "chart",
+                "chart_spec": vchart_spec
+            })
+
+    # 5. Cleaned Summary (Business Insight)
+    elements.append({
+        "tag": "markdown",
+        "content": cleaned_summary or "查询成功，请见下方明细。"
+    })
+
+    # 6. Interactive Follow-up Question Action Buttons (Temporarily Commented Out)
+    # if result.recommended_questions:
+    #     button_actions = []
+    #     for q in result.recommended_questions[:3]:
+    #         display_title = q[:20] + "..." if len(q) > 20 else q
+    #         button_actions.append({
+    #             "tag": "button",
+    #             "text": {"tag": "plain_text", "content": f"🔘 {display_title}"},
+    #             "type": "primary",
+    #             "value": {
+    #                 "action": "quick_query",
+    #                 "query": q
+    #             }
+    #         })
+    #     elements.append({
+    #         "tag": "markdown",
+    #         "content": "**💡 猜您想问（点击直接发起下一轮分析）：**"
+    #     })
+    #     elements.append({
+    #         "tag": "action",
+    #         "actions": button_actions
+    #     })
+
+    card_content = {
+        "schema": "2.0",
+        "config": {
+            "wide_screen_mode": True,
+            "enable_forward": True
+        },
+        "header": {
+            "template": "indigo",
+            "title": {
+                "tag": "plain_text",
+                "content": "📊 BQCA 智能数据分析"
+            }
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": elements
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.patch(
+            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "content": json.dumps(card_content),
+            },
+        )
+        resp_json = resp.json()
+        if resp.status_code == 200 and resp_json.get("code") == 0:
+            logger.info("Stage 3 final result card PATCH updated successfully (message_id=%s).", message_id)
+            return True
+        logger.error("Failed to PATCH final card message_id %s: %s", message_id, resp_json)
+        return False
