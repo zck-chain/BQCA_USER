@@ -23,6 +23,7 @@ from app.feishu.event import (
     is_bot_mentioned,
     is_event_expired,
     parse_card_action,
+    verify_event,
 )
 from app.feishu.message import send_text_message, send_result_card, send_premium_result_card
 from app.storage.sqlite import (
@@ -237,6 +238,13 @@ async def webhook_event(request: Request):
     body = await request.json()
     app_id = extract_app_id(body)
 
+    # Authenticate the callback before doing any work: reject events whose
+    # verification token does not match the bot app that owns app_id. When no
+    # token is configured (local dev), verification is a no-op.
+    if not verify_event(body, app_id=app_id):
+        logger.warning("Rejected Feishu event with invalid verification token (app_id=%s)", app_id)
+        raise HTTPException(status_code=401, detail="invalid verification token")
+
     # Feishu URL verification
     if body.get("type") == "url_verification":
         return {"challenge": body.get("challenge")}
@@ -315,19 +323,25 @@ class _ThrottledSummaryPatch:
             self._stage = stage
 
     async def _flush(self) -> None:
-        await asyncio.sleep(self._interval)
-        self._task = None
+        # Keep self._task pointing at this task for the whole sleep+PATCH so a
+        # schedule() landing inside the throttle window sees it as in-flight and
+        # coalesces instead of spawning a second concurrent PATCH. Reset only on
+        # exit (normal completion or cancel()).
         try:
-            await self._adapter.patch_partial_summary(
-                self._message_id,
-                self._question,
-                self._thoughts,
-                self._partial_summary,
-                self._stage,
-                app_id=self._app_id,
-            )
-        except Exception as e:
-            logger.warning("Throttled partial summary PATCH failed: %s", e)
+            await asyncio.sleep(self._interval)
+            try:
+                await self._adapter.patch_partial_summary(
+                    self._message_id,
+                    self._question,
+                    self._thoughts,
+                    self._partial_summary,
+                    self._stage,
+                    app_id=self._app_id,
+                )
+            except Exception as e:
+                logger.warning("Throttled partial summary PATCH failed: %s", e)
+        finally:
+            self._task = None
 
     def schedule(self) -> None:
         """Schedule a trailing-edge flush; coalesces repeated calls within the window."""
@@ -375,6 +389,15 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
         sql_updated = False
         data_updated = False
 
+        # Throttled partial-summary PATCHer: surfaces the thought chain and
+        # progressively-arriving SUMMARY blocks as in-place card edits. Created
+        # only when we have a message_id to PATCH; cancelled before the final
+        # card so a stale trailing PATCH can't clobber it.
+        throttler = (
+            _ThrottledSummaryPatch(adapter, message_id, question, app_id)
+            if message_id else None
+        )
+
         async for event in chat_stream_events(
             question,
             conversation_name=conversation_name,
@@ -384,7 +407,15 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
             if event.result and event.result.conversation_name:
                 _save_conversation(session_key, event.result.conversation_name)
 
-            if event.event_type == BQCAEventType.SQL and not sql_updated and message_id:
+            if event.event_type == BQCAEventType.THOUGHT and throttler:
+                throttler.update(thoughts=event.data, stage="🧠 *正在分析业务问题...*")
+                throttler.schedule()
+
+            elif event.event_type == BQCAEventType.SUMMARY and throttler:
+                throttler.update(partial_summary=event.data, stage="✍️ *正在生成商业洞察...*")
+                throttler.schedule()
+
+            elif event.event_type == BQCAEventType.SQL and not sql_updated and message_id:
                 sql_updated = True
                 await adapter.patch_progress_card(
                     message_id,
@@ -406,6 +437,10 @@ async def _process_query(question: str, chat_id: str, platform: str = "feishu", 
                 )
 
             elif event.event_type == BQCAEventType.FINAL:
+                # Drop any trailing partial PATCH still awaiting its throttle
+                # window so it can't overwrite the final card we're about to send.
+                if throttler:
+                    throttler.cancel()
                 final_result = event.result
 
         if not final_result:

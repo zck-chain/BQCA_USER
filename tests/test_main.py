@@ -44,6 +44,20 @@ def isolated_sqlite_db(tmp_path, monkeypatch):
   yield
 
 
+@pytest.fixture(autouse=True)
+def _disable_feishu_verification(monkeypatch):
+  """Default webhook tests to auth-disabled (no token configured).
+
+  The real .env sets verification tokens; without this, every synthetic webhook
+  POST would be rejected with 401. Auth-specific tests re-enable a known token.
+  """
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_VERIFICATION_TOKEN", "")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_APP_ID", "game-app")
+  yield
+
+
 def test_health():
   resp = client.get("/health")
   assert resp.status_code == 200
@@ -58,6 +72,90 @@ def test_webhook_challenge():
   })
   assert resp.status_code == 200
   assert resp.json()["challenge"] == "test_challenge"
+
+
+def test_webhook_rejects_event_with_wrong_token(monkeypatch):
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "secret-token")
+
+  event = {
+      "header": {"event_id": "evt_bad", "token": "wrong-token"},
+      "event": {
+          "message": {
+              "message_id": "msg_bad",
+              "chat_id": "oc_test",
+              "chat_type": "p2p",
+              "content": '{"text":"查看订单"}',
+              "message_type": "text",
+          },
+          "sender": {"sender_id": {"open_id": "ou_1"}},
+      },
+  }
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 401
+  mock_process.assert_not_awaited()
+
+
+def test_webhook_accepts_event_with_correct_v2_header_token(monkeypatch):
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "secret-token")
+
+  event = {
+      "header": {"event_id": "evt_ok", "token": "secret-token"},
+      "event": {
+          "message": {
+              "message_id": "msg_ok",
+              "chat_id": "oc_test",
+              "chat_type": "p2p",
+              "content": '{"text":"查看订单"}',
+              "message_type": "text",
+          },
+          "sender": {"sender_id": {"open_id": "ou_1"}},
+      },
+  }
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 200
+  mock_process.assert_awaited_once()
+
+
+def test_webhook_uses_game_token_for_game_app(monkeypatch):
+  from app.config import settings as app_settings
+  monkeypatch.setattr(app_settings, "FEISHU_VERIFICATION_TOKEN", "ecom-token")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_VERIFICATION_TOKEN", "game-token")
+  monkeypatch.setattr(app_settings, "GAME_FEISHU_APP_ID", "game-app")
+
+  # Event tagged with the game app_id but carrying the ecommerce token must be rejected.
+  event = {
+      "header": {
+          "event_id": "evt_game",
+          "token": "ecom-token",
+          "app_id": "game-app",
+      },
+      "event": {
+          "app_id": "game-app",
+          "message": {
+              "message_id": "msg_game",
+              "chat_id": "oc_game",
+              "chat_type": "p2p",
+              "content": '{"text":"DAU"}',
+              "message_type": "text",
+          },
+          "sender": {"sender_id": {"open_id": "ou_g"}},
+      },
+  }
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 401
+  mock_process.assert_not_awaited()
+
+  # ...and accepted with the game token.
+  event["header"]["token"] = "game-token"
+  with patch("app.main._process_query", new_callable=AsyncMock) as mock_process:
+      resp = client.post("/webhook/event", json=event)
+  assert resp.status_code == 200
+  mock_process.assert_awaited_once()
 
 
 def test_handle_message_event():
@@ -444,3 +542,49 @@ async def test_streaming_loop_cancels_trailing_summary_patch_before_final():
     # No trailing partial PATCH ever fired (it was cancelled before its 0.8s delay).
     adapter.patch_partial_summary.assert_not_awaited()
     adapter.patch_final_card.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_throttled_summary_patch_coalesces_bursts():
+    """Two schedule() calls inside one throttle window must fire exactly one PATCH.
+
+    Regression guard: _task must remain set across the await sleep so the second
+    schedule() sees an in-flight flush and coalesces instead of spawning a second
+    concurrent PATCH (which defeats the throttle and can hit Feishu rate limits).
+    """
+    from app.main import _ThrottledSummaryPatch
+
+    adapter = MagicMock()
+    adapter.patch_partial_summary = AsyncMock(return_value=True)
+    throttler = _ThrottledSummaryPatch(
+        adapter, "om_msg", "问题", app_id=None, interval=0.1,
+    )
+
+    throttler.update(partial_summary="第一段")
+    throttler.schedule()
+    await asyncio.sleep(0.03)
+    throttler.update(partial_summary="第一段\n第二段")
+    throttler.schedule()  # must coalesce, not spawn a second flush
+    await asyncio.sleep(0.25)
+
+    assert adapter.patch_partial_summary.await_count == 1
+    # The single trailing flush carries the latest accumulated text.
+    assert adapter.patch_partial_summary.await_args.args[3] == "第一段\n第二段"
+
+
+@pytest.mark.asyncio
+async def test_throttled_summary_patch_cancel_skips_patch():
+    from app.main import _ThrottledSummaryPatch
+
+    adapter = MagicMock()
+    adapter.patch_partial_summary = AsyncMock(return_value=True)
+    throttler = _ThrottledSummaryPatch(
+        adapter, "om_msg", "问题", app_id=None, interval=0.3,
+    )
+    throttler.update(partial_summary="部分")
+    throttler.schedule()
+    await asyncio.sleep(0.05)
+    throttler.cancel()
+    await asyncio.sleep(0.4)
+
+    adapter.patch_partial_summary.assert_not_awaited()
