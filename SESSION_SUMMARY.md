@@ -1,11 +1,11 @@
 # BQCA 项目会话全量总结报告 (Session Summary)
 
-> **最近更新时间**：2026-08-11 10:35:00 (Asia/Shanghai)  
-> **云端部署状态**：Google Cloud Run 服务 `bqca-bot` 最新 Revision `bqca-bot-00075-rrl` 已 100% 满血上线！  
+> **最近更新时间**：2026-08-11 10:50:00 (Asia/Shanghai)  
+> **云端部署状态**：Google Cloud Run 服务 `bqca-bot` 最新 Revision `bqca-bot-00077-rhx` 已 100% 满血上线！  
 > **服务 URL**：`https://bqca-bot-839062387451.asia-east1.run.app`  
 > **项目 Git 分支状态**：
-> - **`main` 分支**（生产主干）：`origin/main` 保持干净安全状态。
-> - **`feature/session-pool` 分支**：已将 `ConversationPoolFactory` 预热对象池代码安全备份至 GitHub 独立分支。
+> - **`main` 分支**（生产主干）：`origin/main` 保持干净安全状态（Commit `6042ed6`）。
+> - **`feature/session-pool` 分支**：已将 `ConversationPoolFactory` 预热对象池代码安全备份至 GitHub 独立分支（Commit `9ec4afd`）。
 
 ---
 
